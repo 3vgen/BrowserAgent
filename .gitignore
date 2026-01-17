@@ -15,5 +15,12 @@ venv/
 .venv/
 app/app.log
 .DS_Store
-src/browser/data
+src/browser_profile/Default/Cache/
+
+src/browser/data/
+src/browser_profile/
+src/browser_profile
+
+src/cli/data/
+src/agents/data/
 
