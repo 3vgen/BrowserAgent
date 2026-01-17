@@ -1,0 +1,17 @@
+.env
+app.log
+
+.idea/
+
+.python-version
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+venv/
+.env/
+.venv/
+app/app.log
+.DS_Store
