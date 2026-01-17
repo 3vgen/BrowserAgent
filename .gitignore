@@ -15,3 +15,5 @@ venv/
 .venv/
 app/app.log
 .DS_Store
+src/browser/data
+
