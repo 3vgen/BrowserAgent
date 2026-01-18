@@ -18,7 +18,7 @@ class OllamaProvider(BaseLLMProvider):
 
     def __init__(
             self,
-            model: str = "qwen2.5:7b",
+            model: str = "qwen2.5:14b",
             temperature: float = 0.4,
             max_tokens: int = 2000,
             host: str = "127.0.0.1",
@@ -162,7 +162,7 @@ class OllamaProvider(BaseLLMProvider):
 
 
 async def create_ollama_provider(
-        model: str = "qwen2.5:7b",
+        model: str = "qwen2.5:14b",
         **kwargs
 ) -> OllamaProvider:
     """Создаёт Ollama провайдер."""
@@ -177,97 +177,97 @@ async def create_ollama_provider(
 
 
 # Тест
-if __name__ == "__main__":
-    import asyncio
-
-    async def test_ollama():
-        """Тестовая функция"""
-
-        print("="*80)
-        print("OLLAMA PROVIDER TEST")
-        print("="*80)
-
-        # Создаём провайдер
-        print("\n📍 Creating provider...")
-        try:
-            provider = await create_ollama_provider(
-                model="qwen2.5:7b",
-                auto_pull=True,
-                temperature=0.7
-            )
-            print(f"✅ Provider ready: {provider}")
-        except LLMProviderError as e:
-            print(f"❌ Error: {e}")
-            print("\nMake sure Ollama is running:")
-            print("  brew install ollama")
-            print("  ollama serve")
-            return
-
-        # Тест 1: Простой запрос
-        print("\n" + "─"*80)
-        print("TEST 1: Simple question")
-        print("─"*80)
-
-        response = await provider.generate_simple(
-            user_message="What is 2+2? Answer in one sentence.",
-            system_prompt="You are a helpful AI assistant."
-        )
-
-        print(f"\n🤖 Response: {response.content}")
-
-        # Тест 2: JSON генерация (важно для агента!)
-        print("\n" + "─"*80)
-        print("TEST 2: JSON generation")
-        print("─"*80)
-
-        response = await provider.generate_simple(
-            user_message="""Сгенерируй JSON объект с этими полями:
-- имя: случайное имя человека
-- возраст: случайный возраст 20-50
-- хобби: случайное хобби
-
-Верни ТОЛЬКО JSON, без другого текста.""",
-            system_prompt="Ты json генератор. Верни только json."
-        )
-
-        print(f"\n🤖 Response:\n{response.content}")
-
-        # Пробуем распарсить JSON
-        try:
-            # Ищем JSON в ответе (на случай если модель добавила текст)
-            content = response.content.strip()
-            start = content.find('{')
-            end = content.rfind('}') + 1
-
-            if 0 <= start < end:
-                json_str = content[start:end]
-                data = json.loads(json_str)
-                print(f"✅ Valid JSON parsed: {data}")
-            else:
-                print("⚠️  No JSON found in response")
-        except json.JSONDecodeError as e:
-            print(f"❌ Invalid JSON: {e}")
-
-        # Тест 3: Диалог с историей
-        print("\n" + "─"*80)
-        print("TEST 3: Conversation with history")
-        print("─"*80)
-
-        messages = [
-            Message(role="user", content="My name is Alex"),
-            Message(role="assistant", content="Nice to meet you, Alex!"),
-            Message(role="user", content="What's my name?")
-        ]
-
-        response = await provider.generate(
-            messages=messages,
-            system_prompt="You are a helpful assistant with good memory."
-        )
-
-        print(f"\n🤖 Response: {response.content}")
-
-        # Закрываем
-        await provider.close()
-        print("\n✅ All tests completed!")
-
-    asyncio.run(test_ollama())
+# if __name__ == "__main__":
+#     import asyncio
+#
+#     async def test_ollama():
+#         """Тестовая функция"""
+#
+#         print("="*80)
+#         print("OLLAMA PROVIDER TEST")
+#         print("="*80)
+#
+#         # Создаём провайдер
+#         print("\n📍 Creating provider...")
+#         try:
+#             provider = await create_ollama_provider(
+#                 model="qwen2.5:14b",
+#                 auto_pull=True,
+#                 temperature=0.7
+#             )
+#             print(f"✅ Provider ready: {provider}")
+#         except LLMProviderError as e:
+#             print(f"❌ Error: {e}")
+#             print("\nMake sure Ollama is running:")
+#             print("  brew install ollama")
+#             print("  ollama serve")
+#             return
+#
+#         # Тест 1: Простой запрос
+#         print("\n" + "─"*80)
+#         print("TEST 1: Simple question")
+#         print("─"*80)
+#
+#         response = await provider.generate_simple(
+#             user_message="What is 2+2? Answer in one sentence.",
+#             system_prompt="You are a helpful AI assistant."
+#         )
+#
+#         print(f"\n🤖 Response: {response.content}")
+#
+#         # Тест 2: JSON генерация (важно для агента!)
+#         print("\n" + "─"*80)
+#         print("TEST 2: JSON generation")
+#         print("─"*80)
+#
+#         response = await provider.generate_simple(
+#             user_message="""Сгенерируй JSON объект с этими полями:
+# - имя: случайное имя человека
+# - возраст: случайный возраст 20-50
+# - хобби: случайное хобби
+#
+# Верни ТОЛЬКО JSON, без другого текста.""",
+#             system_prompt="Ты json генератор. Верни только json."
+#         )
+#
+#         print(f"\n🤖 Response:\n{response.content}")
+#
+#         # Пробуем распарсить JSON
+#         try:
+#             # Ищем JSON в ответе (на случай если модель добавила текст)
+#             content = response.content.strip()
+#             start = content.find('{')
+#             end = content.rfind('}') + 1
+#
+#             if 0 <= start < end:
+#                 json_str = content[start:end]
+#                 data = json.loads(json_str)
+#                 print(f"✅ Valid JSON parsed: {data}")
+#             else:
+#                 print("⚠️  No JSON found in response")
+#         except json.JSONDecodeError as e:
+#             print(f"❌ Invalid JSON: {e}")
+#
+#         # Тест 3: Диалог с историей
+#         print("\n" + "─"*80)
+#         print("TEST 3: Conversation with history")
+#         print("─"*80)
+#
+#         messages = [
+#             Message(role="user", content="My name is Alex"),
+#             Message(role="assistant", content="Nice to meet you, Alex!"),
+#             Message(role="user", content="What's my name?")
+#         ]
+#
+#         response = await provider.generate(
+#             messages=messages,
+#             system_prompt="You are a helpful assistant with good memory."
+#         )
+#
+#         print(f"\n🤖 Response: {response.content}")
+#
+#         # Закрываем
+#         await provider.close()
+#         print("\n✅ All tests completed!")
+#
+#     asyncio.run(test_ollama())

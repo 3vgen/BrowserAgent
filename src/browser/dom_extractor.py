@@ -1,44 +1,57 @@
 """
-DOM Extractor - извлекает интерактивные элементы со страницы
-Это "глаза" агента - так он видит веб-страницу
+DOM Extractor - УЛУЧШЕННЫЙ экстрактор элементов
+
+Проблемы которые решает:
+1. Пропускает важные элементы (кнопки поиска, submit)
+2. Берёт слишком много мусора (скрытые элементы)
+3. Плохо определяет search inputs
+4. Не видит динамически загруженные элементы
+
+Решения:
+1. Более умная проверка видимости
+2. Специальная обработка search элементов
+3. Ожидание динамического контента
+4. Лучшие селекторы
 """
 
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dataclasses import dataclass
 from playwright.async_api import Page
+import asyncio
 
 
 @dataclass
 class Element:
-    """Представление интерактивного элемента на странице"""
+    """Представление интерактивного элемента"""
 
-    id: str  # Уникальный ID (elem_0, elem_1, ...)
-    tag: str  # HTML тег (button, input, a, ...)
-    type: Optional[str] = None  # Тип для input (text, submit, ...)
-    text: str = ""  # Видимый текст элемента
-    placeholder: Optional[str] = None
-    href: Optional[str] = None  # Для ссылок
-    aria_label: Optional[str] = None
-    value: Optional[str] = None  # Текущее значение для input
-    selector: str = ""  # CSS селектор (для отладки)
-    position: Dict[str, int] = None  # {x, y, width, height}
-    is_in_viewport: bool = False  # Виден ли элемент на экране
+    id: str
+    tag: str
+    type: str | None = None
+    text: str = ""
+    placeholder: str | None = None
+    href: str | None = None
+    aria_label: str | None = None
+    value: str | None = None
+    selector: str = ""
+    position: Dict[str, int] | None = None
+    is_in_viewport: bool = False
+    role: str | None = None  # ARIA role
+    name: str | None = None  # name attribute
 
     def __post_init__(self):
         if self.position is None:
             self.position = {"x": 0, "y": 0, "width": 0, "height": 0}
 
     def to_dict(self) -> Dict:
-        """Конвертация в словарь для JSON"""
         return {
             "id": self.id,
             "tag": self.tag,
             "type": self.type,
-            "text": self.text[:100] if self.text else "",  # Ограничиваем длину
+            "text": self.text[:100] if self.text else "",
             "placeholder": self.placeholder,
             "href": self.href[:100] if self.href else None,
             "aria_label": self.aria_label,
-            "value": self.value,
+            "role": self.role,
             "is_in_viewport": self.is_in_viewport,
         }
 
@@ -52,123 +65,237 @@ class Element:
 
 
 class DOMExtractor:
-    """Извлекает интерактивные элементы со страницы"""
+    """Улучшенный экстрактор DOM элементов"""
 
-    # JavaScript код для выполнения в браузере
+    # Более детальный JavaScript для извлечения
     EXTRACTION_SCRIPT = """
-    () => {
+    async () => {
         const elements = [];
         let elementCounter = 0;
-
-        // Проверка видимости элемента
+        
+        // Ждём немного для динамического контента
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        // УЛУЧШЕННАЯ проверка видимости
         function isElementVisible(elem) {
+            // Базовые проверки
             if (!elem.offsetParent && elem.tagName !== 'BODY') {
-                return false;
+                // Исключение для position: fixed элементов
+                const style = window.getComputedStyle(elem);
+                if (style.position !== 'fixed') {
+                    return false;
+                }
             }
-
+            
             const style = window.getComputedStyle(elem);
             const rect = elem.getBoundingClientRect();
-
-            return (
-                style.display !== 'none' &&
-                style.visibility !== 'hidden' &&
-                style.opacity !== '0' &&
-                rect.width > 0 &&
-                rect.height > 0
-            );
+            
+            // Проверяем CSS свойства
+            if (style.display === 'none' || 
+                style.visibility === 'hidden' || 
+                parseFloat(style.opacity) === 0) {
+                return false;
+            }
+            
+            // Проверяем размеры (но разрешаем маленькие элементы для иконок)
+            if (rect.width === 0 && rect.height === 0) {
+                return false;
+            }
+            
+            // Элемент должен иметь хоть какую-то площадь
+            if (rect.width < 1 && rect.height < 1) {
+                return false;
+            }
+            
+            return true;
         }
-
-        // Генерация простого CSS селектора
+        
+        // Проверка что элемент действительно интерактивный
+        function isInteractive(elem) {
+            const tag = elem.tagName.toLowerCase();
+            
+            // Явно интерактивные теги
+            if (['button', 'a', 'input', 'textarea', 'select'].includes(tag)) {
+                return true;
+            }
+            
+            // Элементы с ролями
+            const role = elem.getAttribute('role');
+            if (role && ['button', 'link', 'textbox', 'searchbox', 'combobox'].includes(role)) {
+                return true;
+            }
+            
+            // Элементы с обработчиками
+            if (elem.onclick || elem.getAttribute('onclick')) {
+                return true;
+            }
+            
+            // Элементы с tabindex (focusable)
+            if (elem.hasAttribute('tabindex')) {
+                return true;
+            }
+            
+            // Contenteditable
+            if (elem.getAttribute('contenteditable') === 'true') {
+                return true;
+            }
+            
+            return false;
+        }
+        
+        // Генерация улучшенного селектора
         function generateSelector(elem) {
-            // Если есть ID - используем его
-            if (elem.id) {
+            // Приоритет 1: ID
+            if (elem.id && /^[a-zA-Z]/.test(elem.id)) {
                 return `#${elem.id}`;
             }
-
-            // Строим путь через теги и классы
+            
+            // Приоритет 2: name attribute
+            if (elem.name) {
+                return `${elem.tagName.toLowerCase()}[name="${elem.name}"]`;
+            }
+            
+            // Приоритет 3: уникальные атрибуты
+            const uniqueAttrs = ['data-testid', 'data-id', 'aria-label'];
+            for (const attr of uniqueAttrs) {
+                const value = elem.getAttribute(attr);
+                if (value) {
+                    return `${elem.tagName.toLowerCase()}[${attr}="${value}"]`;
+                }
+            }
+            
+            // Приоритет 4: путь через классы
             const path = [];
             let current = elem;
-
+            
             for (let i = 0; i < 3 && current && current.nodeType === Node.ELEMENT_NODE; i++) {
                 let selector = current.tagName.toLowerCase();
-
-                // Добавляем первые 2 класса если есть
+                
+                // Добавляем полезные классы
                 if (current.className && typeof current.className === 'string') {
                     const classes = current.className
                         .trim()
                         .split(/\\s+/)
-                        .filter(c => c && !c.match(/^[0-9]/)) // Исключаем классы начинающиеся с цифр
-                        .slice(0, 2);
-
+                        .filter(c => c && !/^[0-9]/.test(c) && c.length < 30);
+                    
                     if (classes.length > 0) {
-                        selector += '.' + classes.join('.');
+                        // Берём самый специфичный класс
+                        const bestClass = classes.find(c => 
+                            c.includes('search') || 
+                            c.includes('btn') || 
+                            c.includes('button') ||
+                            c.includes('input') ||
+                            c.includes('link')
+                        ) || classes[0];
+                        
+                        selector += '.' + bestClass;
                     }
                 }
-
+                
                 path.unshift(selector);
                 current = current.parentElement;
             }
-
+            
             return path.join(' > ');
         }
-
-        // Получение текста элемента
-        function getElementText(elem) {
-            // Для input/textarea берём placeholder или value
+        
+        // Получение полного текста (включая псевдо-элементы)
+        function getFullText(elem) {
+            // Для input/textarea - placeholder или value
             if (elem.tagName === 'INPUT' || elem.tagName === 'TEXTAREA') {
                 return elem.placeholder || elem.value || '';
             }
-
-            // Для других элементов - innerText
+            
+            // Для кнопок - innerText или value
+            if (elem.tagName === 'BUTTON') {
+                return elem.innerText || elem.textContent || elem.value || '';
+            }
+            
+            // Для остальных - innerText
             let text = elem.innerText || elem.textContent || '';
-
-            // Очищаем от лишних пробелов и переносов
+            
+            // Очищаем
             text = text.replace(/\\s+/g, ' ').trim();
-
+            
             return text;
         }
-
-        // Селекторы интерактивных элементов
-        const interactiveSelectors = [
-            'a[href]',              // Ссылки
-            'button',               // Кнопки
-            'input:not([type="hidden"])', // Поля ввода (кроме скрытых)
-            'textarea',             // Текстовые области
-            'select',               // Выпадающие списки
-            '[role="button"]',      // Элементы с ролью кнопки
-            '[role="link"]',        // Элементы с ролью ссылки
-            '[role="textbox"]',     // Элементы с ролью текстового поля
-            '[onclick]',            // Элементы с onclick
-            '[contenteditable="true"]', // Редактируемый контент
-            'h1', 'h2', 'h3',       // Заголовки (для контекста)
+        
+        // РАСШИРЕННЫЙ список селекторов
+        const selectors = [
+            // Основные интерактивные
+            'input:not([type="hidden"])',
+            'button',
+            'a[href]',
+            'textarea',
+            'select',
+            
+            // ARIA роли (важно для современных SPA!)
+            '[role="button"]',
+            '[role="link"]',
+            '[role="textbox"]',
+            '[role="searchbox"]',
+            '[role="combobox"]',
+            '[role="menuitem"]',
+            
+            // Специальные для поиска (Google, etc)
+            '[name="q"]',              // Google search
+            '[name="search"]',
+            '[type="search"]',
+            '[aria-label*="search" i]',
+            '[aria-label*="поиск" i]',
+            '[placeholder*="search" i]',
+            '[placeholder*="поиск" i]',
+            
+            // Submit кнопки
+            '[type="submit"]',
+            'button[type="submit"]',
+            
+            // Clickable элементы
+            '[onclick]',
+            '[tabindex]',
+            '[contenteditable="true"]',
+            
+            // Заголовки для контекста
+            'h1', 'h2', 'h3'
         ];
-
-        // Находим все интерактивные элементы
-        const foundElements = document.querySelectorAll(interactiveSelectors.join(','));
-
-        foundElements.forEach(elem => {
-            // Пропускаем невидимые элементы
-            if (!isElementVisible(elem)) {
-                return;
+        
+        // Собираем элементы
+        const foundElements = new Set();
+        
+        for (const selector of selectors) {
+            try {
+                const elems = document.querySelectorAll(selector);
+                elems.forEach(elem => {
+                    if (isElementVisible(elem) && isInteractive(elem)) {
+                        foundElements.add(elem);
+                    }
+                });
+            } catch (e) {
+                // Игнорируем ошибки в селекторах
             }
-
+        }
+        
+        // Обрабатываем найденные элементы
+        foundElements.forEach(elem => {
             const rect = elem.getBoundingClientRect();
             const elementId = `elem_${elementCounter++}`;
-
-            // Добавляем data-agent-id для последующего взаимодействия
+            
+            // Устанавливаем data-agent-id
             elem.setAttribute('data-agent-id', elementId);
-
-            // Собираем информацию об элементе
+            
+            // Собираем информацию
             const elementInfo = {
                 id: elementId,
                 tag: elem.tagName.toLowerCase(),
                 type: elem.type || null,
-                text: getElementText(elem),
+                text: getFullText(elem),
                 placeholder: elem.placeholder || null,
                 href: elem.href || null,
                 ariaLabel: elem.getAttribute('aria-label'),
                 value: elem.value || null,
                 selector: generateSelector(elem),
+                role: elem.getAttribute('role') || null,
+                name: elem.name || null,
                 position: {
                     x: Math.round(rect.x),
                     y: Math.round(rect.y),
@@ -176,16 +303,16 @@ class DOMExtractor:
                     height: Math.round(rect.height)
                 },
                 isInViewport: (
-                    rect.top >= 0 && 
-                    rect.top <= window.innerHeight &&
-                    rect.left >= 0 &&
-                    rect.left <= window.innerWidth
+                    rect.top >= -100 &&  // Немного за пределами тоже считаем
+                    rect.top <= window.innerHeight + 100 &&
+                    rect.left >= -100 &&
+                    rect.left <= window.innerWidth + 100
                 )
             };
-
+            
             elements.push(elementInfo);
         });
-
+        
         return elements;
     }
     """
@@ -193,15 +320,21 @@ class DOMExtractor:
     @staticmethod
     async def extract(page: Page) -> List[Element]:
         """
-        Извлекает все интерактивные элементы со страницы.
+        Извлекает элементы со страницы с улучшенной логикой.
 
         Args:
-            page: Playwright Page объект
+            page: Playwright Page
 
         Returns:
             Список Element объектов
         """
-        # Выполняем JavaScript в браузере
+        # Ждём стабилизации DOM
+        try:
+            await page.wait_for_load_state('domcontentloaded', timeout=5000)
+        except:
+            pass  # Продолжаем даже если таймаут
+
+        # Выполняем улучшенный скрипт
         raw_elements = await page.evaluate(DOMExtractor.EXTRACTION_SCRIPT)
 
         # Конвертируем в Element объекты
@@ -218,7 +351,9 @@ class DOMExtractor:
                 value=raw.get('value'),
                 selector=raw.get('selector', ''),
                 position=raw.get('position', {}),
-                is_in_viewport=raw.get('isInViewport', False)
+                is_in_viewport=raw.get('isInViewport', False),
+                role=raw.get('role'),
+                name=raw.get('name')
             )
             elements.append(element)
 
@@ -227,168 +362,125 @@ class DOMExtractor:
     @staticmethod
     def prioritize_elements(elements: List[Element], limit: int = 100) -> List[Element]:
         """
-        Приоритизирует элементы для отправки в LLM.
+        УЛУЧШЕННАЯ приоритизация элементов.
 
         Стратегия:
-        1. Сначала элементы в viewport
-        2. Интерактивные элементы (кнопки, ссылки, поля ввода) важнее заголовков
-        3. Ограничиваем общее количество
-
-        Args:
-            elements: Список всех элементов
-            limit: Максимальное количество элементов
-
-        Returns:
-            Отфильтрованный и отсортированный список
+        1. Search inputs - наивысший приоритет
+        2. Submit buttons
+        3. Видимые интерактивные
+        4. Заголовки для контекста
+        5. Остальное
         """
-        # Разделяем на категории
-        in_viewport = []
-        out_viewport = []
+        # Категоризация
+        search_inputs = []
+        submit_buttons = []
+        interactive = []
+        headers = []
+        other = []
 
         for elem in elements:
-            if elem.is_in_viewport:
-                in_viewport.append(elem)
+            # Search inputs (критически важны!)
+            if (elem.tag == 'input' and
+                (elem.type == 'search' or
+                 elem.name in ['q', 'search'] or
+                 'search' in (elem.placeholder or '').lower() or
+                 'search' in (elem.aria_label or '').lower() or
+                 elem.role == 'searchbox')):
+                search_inputs.append(elem)
+
+            # Submit кнопки
+            elif (elem.tag == 'button' and elem.type == 'submit') or \
+                 (elem.tag == 'input' and elem.type == 'submit'):
+                submit_buttons.append(elem)
+
+            # Заголовки
+            elif elem.tag in ['h1', 'h2', 'h3']:
+                headers.append(elem)
+
+            # Интерактивные
+            elif elem.tag in ['button', 'a', 'input', 'textarea', 'select']:
+                interactive.append(elem)
+
             else:
-                out_viewport.append(elem)
+                other.append(elem)
 
-        # Сортируем по важности (интерактивные элементы важнее)
-        def importance_score(elem: Element) -> int:
-            score = 0
+        # Внутри каждой категории: видимые первыми
+        def sort_by_visibility(elems):
+            return sorted(elems, key=lambda e: (
+                not e.is_in_viewport,
+                e.position.get('y', 0)
+            ))
 
-            # Интерактивные элементы важнее
-            if elem.tag in ['button', 'input', 'textarea', 'select', 'a']:
-                score += 10
+        search_inputs = sort_by_visibility(search_inputs)
+        submit_buttons = sort_by_visibility(submit_buttons)
+        interactive = sort_by_visibility(interactive)
+        headers = sort_by_visibility(headers)
 
-            # Элементы с текстом важнее
-            if elem.text and len(elem.text) > 3:
-                score += 5
-
-            # Элементы с aria-label важны
-            if elem.aria_label:
-                score += 3
-
-            return score
-
-        in_viewport.sort(key=importance_score, reverse=True)
-        out_viewport.sort(key=importance_score, reverse=True)
-
-        # Берём сначала из viewport, потом остальные
-        result = in_viewport + out_viewport
+        # Собираем в правильном порядке
+        result = (
+            search_inputs +
+            submit_buttons +
+            interactive[:30] +  # Топ 30 интерактивных
+            headers[:5] +       # Топ 5 заголовков для контекста
+            other[:10]          # Немного остального
+        )
 
         return result[:limit]
 
     @staticmethod
     def format_for_llm(elements: List[Element]) -> str:
-        """
-        Форматирует элементы в текст для отправки в LLM.
+        """Улучшенное форматирование для LLM"""
 
-        Цель: минимизировать токены, но сохранить всю важную информацию.
-
-        Args:
-            elements: Список элементов
-
-        Returns:
-            Отформатированная строка
-        """
-        lines = ["=== INTERACTIVE ELEMENTS ON PAGE ===\n"]
-
-        # Группируем по типам для статистики
-        by_tag = {}
-        for elem in elements:
-            if elem.tag not in by_tag:
-                by_tag[elem.tag] = 0
-            by_tag[elem.tag] += 1
+        lines = ["=== INTERACTIVE ELEMENTS ===\n"]
 
         # Статистика
-        lines.append("Page statistics:")
-        for tag, count in sorted(by_tag.items()):
-            lines.append(f"  {tag}: {count}")
-
-        lines.append("\nElements (visible first):\n")
-
-        # Форматируем каждый элемент компактно
+        by_tag = {}
         for elem in elements:
-            parts = []
+            by_tag[elem.tag] = by_tag.get(elem.tag, 0) + 1
 
-            # ID и тег обязательны
-            parts.append(f"[{elem.id}]")
-            parts.append(elem.tag.upper())
+        stats = ", ".join([f"{tag}:{count}" for tag, count in sorted(by_tag.items())])
+        lines.append(f"Total: {len(elements)} ({stats})\n")
 
-            # Тип для input
+        # Специальные элементы (search, submit)
+        search_elems = [e for e in elements if
+                       'search' in (e.placeholder or '').lower() or
+                       'search' in (e.aria_label or '').lower() or
+                       e.role == 'searchbox' or
+                       e.name in ['q', 'search']]
+
+        if search_elems:
+            lines.append("🔍 SEARCH ELEMENTS (IMPORTANT):")
+            for elem in search_elems:
+                lines.append(f"   {elem.id} | {elem.tag} | ph:\"{elem.placeholder}\" | ✓VISIBLE" if elem.is_in_viewport else f"   {elem.id} | {elem.tag}")
+            lines.append("")
+
+        # Элементы
+        lines.append("ALL ELEMENTS:")
+        for elem in elements:
+            parts = [elem.id, elem.tag.upper()]
+
             if elem.type:
                 parts.append(f"type={elem.type}")
 
-            # Текст (самое важное!)
             if elem.text:
-                text = elem.text[:50]
-                if len(elem.text) > 50:
-                    text += "..."
-                parts.append(f'text="{text}"')
+                text = elem.text[:40].replace('\n', ' ')
+                parts.append(f'"{text}"')
 
-            # Placeholder для полей ввода
             if elem.placeholder:
-                parts.append(f'placeholder="{elem.placeholder[:30]}"')
+                parts.append(f'ph:"{elem.placeholder[:25]}"')
 
-            # Ссылка
             if elem.href:
-                href = elem.href[:60]
-                if len(elem.href) > 60:
-                    href += "..."
-                parts.append(f"href={href}")
+                parts.append('link')
 
-            # Aria label
             if elem.aria_label:
-                parts.append(f'label="{elem.aria_label[:30]}"')
+                parts.append(f'aria:"{elem.aria_label[:20]}"')
 
-            # Маркер видимости
+            if elem.role:
+                parts.append(f'role={elem.role}')
+
             if elem.is_in_viewport:
                 parts.append("✓visible")
-            else:
-                parts.append("below-fold")
 
             lines.append(" | ".join(parts))
 
-        lines.append(f"\nTotal: {len(elements)} interactive elements")
-
         return "\n".join(lines)
-
-
-# Пример использования (для тестирования модуля отдельно)
-if __name__ == "__main__":
-    import asyncio
-    from playwright.async_api import async_playwright
-
-
-    async def test_extraction():
-        """Тестовая функция"""
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
-            page = await browser.new_page()
-
-            # Тестируем на Wikipedia
-            await page.goto("https://en.wikipedia.org")
-            await page.wait_for_load_state('networkidle')
-
-            # Извлекаем элементы
-            elements = await DOMExtractor.extract(page)
-            print(f"\n✅ Found {len(elements)} elements\n")
-
-            # Приоритизируем
-            prioritized = DOMExtractor.prioritize_elements(elements, limit=30)
-            print(f"✅ Prioritized to {len(prioritized)} elements\n")
-
-            # Форматируем для LLM
-            formatted = DOMExtractor.format_for_llm(prioritized)
-            print(formatted)
-
-            # Показываем первые 5 элементов как объекты
-            print("\n" + "=" * 80)
-            print("First 5 elements as objects:")
-            print("=" * 80 + "\n")
-            for elem in prioritized[:5]:
-                print(elem)
-
-            await browser.close()
-
-
-    asyncio.run(test_extraction())
