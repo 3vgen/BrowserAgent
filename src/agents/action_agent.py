@@ -1,17 +1,17 @@
 """
 Action Agent - оптимизированное принятие решений
 
-Улучшения:
-- Более точные промпты с примерами
-- Валидация действий
-- Предотвращение зацикливания
-- История с анализом паттернов
+Ключевые улучшения:
+- Интеграция с приоритетами элементов от Vision Agent
+- Умная детекция зацикливания с адаптацией
+- Предсказание успешности действия
+- Graceful degradation при проблемах
 """
 
 import json
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, asdict
-from collections import Counter
+from collections import Counter, deque
 
 from ..llm.base import BaseLLMProvider
 from ..browser.dom_extractor import Element
@@ -25,6 +25,7 @@ class Action:
     params: Dict[str, Any]
     reasoning: str = ""
     confidence: float = 0.0
+    expected_outcome: str = ""  # Что ожидаем после действия
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'Action':
@@ -32,7 +33,8 @@ class Action:
             type=data.get('type', 'wait'),
             params=data.get('params', {}),
             reasoning=data.get('reasoning', ''),
-            confidence=data.get('confidence', 0.5)
+            confidence=data.get('confidence', 0.5),
+            expected_outcome=data.get('expected_outcome', '')
         )
 
     def to_dict(self) -> Dict:
@@ -41,140 +43,91 @@ class Action:
     def __repr__(self) -> str:
         return f"<Action {self.type} conf={self.confidence:.2f}>"
 
-    def __eq__(self, other) -> bool:
-        """Проверка на одинаковые действия (для детекции зацикливания)"""
-        if not isinstance(other, Action):
-            return False
-        return (self.type == other.type and
-                self.params == other.params)
+    def signature(self) -> str:
+        """Уникальная сигнатура действия для детекции повторов"""
+        return f"{self.type}:{json.dumps(self.params, sort_keys=True)}"
 
 
 class ActionAgent:
     """
-    Оптимизированный Action Agent.
-
-    Улучшения:
-    1. Более детальные промпты с примерами
-    2. Валидация действий перед выполнением
-    3. Детекция зацикливания
-    4. Адаптивная уверенность на основе истории
-    5. Graceful degradation при ошибках
+    Оптимизированный Action Agent с адаптивным поведением.
     """
 
-    # Улучшенный промпт с примерами
-    SYSTEM_PROMPT = """You are an Action Agent - you decide what browser actions to take to accomplish goals.
+    SYSTEM_PROMPT = """You are an Action Agent deciding browser actions to accomplish goals.
 
-You work with Vision Agent who analyzed the page. Use their JSON insights to make smart decisions.  
-Vision Agent provides: page_type, relevant_elements, observations, steps, and warnings.
+You receive analysis from Vision Agent including:
+- page_type: type of current page
+- relevant_elements: element IDs with priorities
+- observations: factual observations about the page
+- next_action_hint: optional suggestion
+- confidence: Vision Agent's confidence
 
 CRITICAL RULES:
-1. Use ONLY element IDs from relevant_elements provided by Vision Agent.
-2. Choose ONE action per response.
-3. Think step-by-step: what brings you closer to the goal?
-4. Use "complete" when goal is clearly achieved or partially achieved.
-   - If Vision Agent indicates page_type = article AND confidence >= 0.9
-     AND content clearly matches the goal, immediately use "complete".
-5. Do not repeat failed actions.
-6. If stuck, try a different approach or complete with partial result.
-7. Consider Vision Agent's "steps" suggestions to guide your decision.
-8. Confidence reflects how sure you are this action moves toward the goal (0.0-1.0).
+1. Use ONLY element IDs from relevant_elements
+2. If Vision Agent suggests page_type="article" AND confidence > 0.85 AND observations indicate goal is achieved → use "complete"
+3. Consider element priorities (higher priority = more relevant)
+4. Avoid repeating failed actions
+5. If stuck after 3 similar attempts, try different approach or complete with partial result
+6. expected_outcome helps verify if action succeeded
 
 AVAILABLE ACTIONS:
-1. navigate    - Go to a URL
-   {"type": "navigate", "params": {"url": "https://example.com"}}
-
-2. click       - Click an element by ID
-   {"type": "click", "params": {"element_id": "elem_5"}}
-
-3. type        - Type text into an input field
-   {"type": "type", "params": {"element_id": "elem_3", "text": "search query"}}
-
-4. press       - Press a keyboard key
-   {"type": "press", "params": {"key": "Enter"}}
-
-5. scroll      - Scroll page (visible portion only)
-   {"type": "scroll", "params": {"direction": "down", "amount": 500}}
-
-6. wait        - Wait for a few seconds
-   {"type": "wait", "params": {"seconds": 2}}
-
-7. complete    - Task is done
-   {"type": "complete", "params": {"result": "successfully found article about Python"}}
+- navigate: {"type": "navigate", "params": {"url": "https://..."}}
+- click: {"type": "click", "params": {"element_id": "elem_X"}}
+- type: {"type": "type", "params": {"element_id": "elem_X", "text": "..."}}
+- press: {"type": "press", "params": {"key": "Enter"}}
+- scroll: {"type": "scroll", "params": {"direction": "down", "amount": 500}}
+- wait: {"type": "wait", "params": {"seconds": 2}}
+- complete: {"type": "complete", "params": {"result": "description of what was achieved"}}
 
 RESPONSE FORMAT (strict JSON):
 {
-  "thinking": "analyze current situation and what needs to happen",
+  "thinking": "analyze situation step-by-step",
   "action": {
     "type": "click",
     "params": {"element_id": "elem_5"}
   },
-  "reasoning": "why this specific action helps achieve the goal",
-  "confidence": 0.85
+  "reasoning": "why this action helps achieve goal",
+  "confidence": 0.85,
+  "expected_outcome": "what should happen after this action"
 }
 
-EXAMPLES:
+DECISION STRATEGY:
+1. Check if goal is already achieved (complete immediately)
+2. If Vision Agent has next_action_hint, consider it
+3. Prioritize elements with higher priority scores
+4. If previous action failed, try alternative approach
+5. If making no progress, consider completing with partial result
 
-Example 1 - Article clearly matches goal:
-Goal: "Find Wikipedia article 'Король и Шут'"
-Vision: {
-  "page_type": "article",
-  "relevant_elements": ["link1", "link2"],
-  "observations": ["Title matches search query"],
-  "steps": ["Goal achieved — content matches search query. Use 'complete' action"],
-  "warnings": [],
-  "confidence": 0.90
-}
-Response:
-{
-  "thinking": "Article clearly matches user's search query. Task is complete.",
-  "action": {"type": "complete", "params": {"result": "Successfully found article 'Король и Шут'"}},
-  "reasoning": "Vision Agent indicates high confidence article matches goal",
-  "confidence": 0.95
-}
-
-Return ONLY valid JSON, no markdown, no extra text.
-"""
+Return ONLY valid JSON, no markdown."""
 
     def __init__(
         self,
         llm_provider: BaseLLMProvider,
         max_history: int = 10,
-        loop_detection_window: int = 3
+        loop_detection_window: int = 4
     ):
-        """
-        Args:
-            llm_provider: LLM провайдер
-            max_history: Максимум действий в истории для контекста
-            loop_detection_window: Окно для детекции зацикливания
-        """
         self.llm = llm_provider
         self.max_history = max_history
         self.loop_detection_window = loop_detection_window
 
-        self.action_history: List[Action] = []
+        self.action_history: deque = deque(maxlen=max_history * 2)
         self.failed_actions: List[Action] = []
+        self.page_visit_count: Counter = Counter()  # Счётчик посещений страниц
 
     def _parse_json_response(self, text: str) -> Optional[Dict]:
-        """Надёжный парсинг JSON (аналогично Vision Agent)"""
+        """Надёжный парсинг JSON"""
         if not text or not text.strip():
             return None
 
-        text = text.strip()
+        text = text.strip().replace('```json', '').replace('```', '').strip()
 
-        # Стратегия 1: Прямой парсинг
+        # Прямой парсинг
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Стратегия 2: Удаляем markdown
-        text = text.replace('```json', '').replace('```', '')
-        try:
-            return json.loads(text.strip())
-        except json.JSONDecodeError:
-            pass
-
-        # Стратегия 3: Извлекаем между { }
+        # Извлечение между { }
         try:
             start = text.find('{')
             end = text.rfind('}') + 1
@@ -190,44 +143,29 @@ Return ONLY valid JSON, no markdown, no extra text.
         data: Dict,
         available_element_ids: List[str]
     ) -> Tuple[bool, str]:
-        """
-        Валидирует действие перед выполнением.
-
-        Returns:
-            (is_valid, error_message)
-        """
+        """Валидация действия"""
         if 'action' not in data:
             return False, "Missing 'action' field"
 
         action = data['action']
-
-        if 'type' not in action:
-            return False, "Missing action type"
-
-        if 'params' not in action:
-            return False, "Missing action params"
+        if 'type' not in action or 'params' not in action:
+            return False, "Invalid action structure"
 
         action_type = action['type']
         params = action['params']
 
-        # Валидация специфичная для типа действия
-        if action_type == 'click':
+        # Валидация по типу
+        if action_type in ['click', 'type']:
             if 'element_id' not in params:
-                return False, "click requires element_id"
+                return False, f"{action_type} requires element_id"
 
             elem_id = params['element_id']
             if elem_id not in available_element_ids:
-                return False, f"element_id {elem_id} not in available elements"
+                return False, f"element_id {elem_id} not available"
 
         elif action_type == 'type':
-            if 'element_id' not in params:
-                return False, "type requires element_id"
             if 'text' not in params:
                 return False, "type requires text"
-
-            elem_id = params['element_id']
-            if elem_id not in available_element_ids:
-                return False, f"element_id {elem_id} not in available elements"
 
         elif action_type == 'navigate':
             if 'url' not in params:
@@ -235,66 +173,82 @@ Return ONLY valid JSON, no markdown, no extra text.
 
             url = params['url']
             if not url.startswith(('http://', 'https://')):
-                return False, "url must start with http:// or https://"
+                return False, "invalid URL"
 
         elif action_type == 'press':
-            if 'key' not in params:
-                params['key'] = 'Enter'  # Default
+            params.setdefault('key', 'Enter')
 
         elif action_type == 'scroll':
-            if 'direction' not in params:
-                params['direction'] = 'down'  # Default
+            params.setdefault('direction', 'down')
+            params.setdefault('amount', 500)
 
         elif action_type == 'wait':
-            if 'seconds' not in params:
-                params['seconds'] = 2  # Default
+            params.setdefault('seconds', 2)
 
         elif action_type == 'complete':
-            if 'result' not in params:
-                params['result'] = 'Task completed'  # Default
+            params.setdefault('result', 'Task completed')
 
-        else:
+        elif action_type not in ['wait', 'complete']:
             return False, f"Unknown action type: {action_type}"
 
         return True, ""
 
-    def _detect_loop(self) -> bool:
+    def _detect_loop(self) -> Tuple[bool, Optional[str]]:
         """
-        Детектирует зацикливание в последних действиях.
+        Детектирует зацикливание.
 
         Returns:
-            True если обнаружено зацикливание
+            (is_loop, loop_type)
         """
         if len(self.action_history) < self.loop_detection_window:
-            return False
+            return False, None
 
-        # Берём последние N действий
-        recent = self.action_history[-self.loop_detection_window:]
+        recent = list(self.action_history)[-self.loop_detection_window:]
+        signatures = [a.signature() for a in recent]
 
-        # Проверяем на одинаковые действия
+        # Тип 1: Одно и то же действие повторяется
+        sig_counts = Counter(signatures)
+        if any(count >= 3 for count in sig_counts.values()):
+            return True, "repeated_action"
+
+        # Тип 2: Цикл из 2-3 действий (A→B→A→B)
+        if len(set(signatures)) <= 2:
+            return True, "action_cycle"
+
+        # Тип 3: Все действия одного типа (только клики)
         action_types = [a.type for a in recent]
-        type_counts = Counter(action_types)
+        if len(set(action_types)) == 1 and action_types[0] != 'wait':
+            return True, "same_type_spam"
 
-        # Если одно действие повторяется слишком часто
-        if any(count >= self.loop_detection_window for count in type_counts.values()):
-            # Проверяем что это именно одинаковые действия (не просто тип)
-            if len(set(str(a.to_dict()) for a in recent)) <= 2:
-                return True
+        return False, None
 
-        return False
-
-    def _format_elements_compact(self, elements: List[Element]) -> str:
-        """Компактное форматирование элементов"""
+    def _format_elements_with_priorities(
+        self,
+        elements: List[Element],
+        priorities: Dict[str, float]
+    ) -> str:
+        """Форматирует элементы с учётом приоритетов"""
         if not elements:
             return "No elements available"
 
+        # Сортируем по приоритету
+        sorted_elements = sorted(
+            elements,
+            key=lambda e: priorities.get(e.id, 0.0),
+            reverse=True
+        )
+
         lines = []
-        for elem in elements[:15]:  # Топ 15
-            parts = [elem.id, elem.tag.upper()]
+        for elem in sorted_elements[:12]:  # Топ 12
+            priority = priorities.get(elem.id, 0.0)
+            priority_marker = "★★★" if priority > 0.8 else "★★" if priority > 0.6 else "★"
+
+            parts = [f"{priority_marker} [{elem.id}]", elem.tag.upper()]
 
             if elem.text:
-                text = elem.text[:30].replace('\n', ' ')
-                parts.append(f'"{text}"')
+                text = elem.text[:35].replace('\n', ' ').strip()
+                if text:
+                    parts.append(f'"{text}"')
 
             if elem.placeholder:
                 parts.append(f'ph:"{elem.placeholder[:20]}"')
@@ -302,43 +256,69 @@ Return ONLY valid JSON, no markdown, no extra text.
             if elem.type:
                 parts.append(f't:{elem.type}')
 
-            lines.append(" | ".join(parts))
+            lines.append(' '.join(parts))
 
-        if len(elements) > 15:
-            lines.append(f"... +{len(elements)-15} more")
+        return '\n'.join(lines)
 
-        return "\n".join(lines)
-
-    def _format_history_smart(self) -> str:
-        """Умное форматирование истории с акцентом на паттерны"""
+    def _format_history_compact(self) -> str:
+        """Компактное форматирование истории"""
         if not self.action_history:
             return "No previous actions"
 
-        recent = self.action_history[-self.max_history:]
-
+        recent = list(self.action_history)[-self.max_history:]
         lines = []
+
         for i, action in enumerate(recent, 1):
-            # Маркер успеха/неуспеха
             failed = action in self.failed_actions
             marker = "❌" if failed else "✓"
 
-            # Маркер уверенности
-            conf_marker = "★" if action.confidence > 0.8 else "~"
+            conf_marker = "★" if action.confidence > 0.8 else "~" if action.confidence > 0.5 else "?"
 
-            action_desc = f"{action.type}"
+            action_desc = action.type
             if action.type in ['click', 'type']:
                 elem_id = action.params.get('element_id', '?')
                 action_desc += f"({elem_id})"
 
-            lines.append(
-                f"{i}. {marker}{conf_marker} {action_desc}: {action.reasoning[:40]}"
-            )
+            lines.append(f"{i}. {marker}{conf_marker} {action_desc}")
 
-        # Добавляем предупреждение если есть петля
-        if self._detect_loop():
-            lines.append("\n⚠️  WARNING: Possible action loop detected!")
+        # Предупреждения
+        is_loop, loop_type = self._detect_loop()
+        if is_loop:
+            lines.append(f"\n⚠️  LOOP DETECTED: {loop_type}")
 
-        return "\n".join(lines)
+        return '\n'.join(lines)
+
+    def _should_complete_early(
+        self,
+        goal: str,
+        vision_analysis: PageAnalysis
+    ) -> Tuple[bool, str]:
+        """
+        Определяет, достигнута ли цель (ранее завершение).
+
+        Returns:
+            (should_complete, reason)
+        """
+        # Высокая уверенность Vision Agent + тип страницы соответствует цели
+        if vision_analysis.confidence > 0.85:
+            page_type = vision_analysis.page_type
+
+            # Если ищем статью и попали на статью
+            if page_type == 'article':
+                # Проверяем observations на совпадение с целью
+                obs_text = ' '.join(vision_analysis.observations).lower()
+                goal_lower = goal.lower()
+
+                # Простая эвристика: есть ли ключевые слова из цели в наблюдениях
+                goal_keywords = set(goal_lower.split()) - {'find', 'search', 'look', 'for', 'the', 'a', 'an'}
+                if any(keyword in obs_text for keyword in goal_keywords):
+                    return True, f"Found article matching goal (confidence: {vision_analysis.confidence:.2f})"
+
+            # Если ищем профиль и попали на профиль
+            if page_type == 'profile' and 'profile' in goal.lower():
+                return True, f"Reached profile page (confidence: {vision_analysis.confidence:.2f})"
+
+        return False, ""
 
     async def decide_action(
         self,
@@ -346,97 +326,148 @@ Return ONLY valid JSON, no markdown, no extra text.
         vision_analysis: PageAnalysis,
         relevant_elements: List[Element],
         step_number: int,
-        max_steps: int
+        max_steps: int,
+        current_url: str = ""
     ) -> Optional[Action]:
         """
         Принимает решение о следующем действии.
-
-        Args:
-            goal: Цель
-            vision_analysis: Анализ от Vision Agent
-            relevant_elements: Отфильтрованные элементы
-            step_number: Текущий шаг
-            max_steps: Максимум шагов
-
-        Returns:
-            Action или None
         """
-        # Форматируем элементы
-        elements_str = self._format_elements_compact(relevant_elements)
+        # Проверяем раннее завершение
+        should_complete, complete_reason = self._should_complete_early(goal, vision_analysis)
+        if should_complete:
+            print(f"✓ Early completion: {complete_reason}")
+            return Action(
+                type='complete',
+                params={'result': complete_reason},
+                reasoning=complete_reason,
+                confidence=vision_analysis.confidence
+            )
+
+        # Отслеживаем посещения страниц
+        if current_url:
+            self.page_visit_count[current_url] += 1
+            if self.page_visit_count[current_url] > 3:
+                print(f"⚠️  Visited {current_url} {self.page_visit_count[current_url]} times")
+
+        # Форматируем элементы с приоритетами
+        elements_str = self._format_elements_with_priorities(
+            relevant_elements,
+            vision_analysis.element_priorities or {}
+        )
         element_ids = [e.id for e in relevant_elements]
 
-        # Форматируем историю
-        history_str = self._format_history_smart()
+        # История
+        history_str = self._format_history_compact()
 
-        # Предупреждение если близко к лимиту
+        # Детекция зацикливания
+        is_loop, loop_type = self._detect_loop()
+        loop_warning = f"\n⚠️  LOOP DETECTED ({loop_type}): Try different approach or complete!" if is_loop else ""
+
+        # Предупреждение о лимите шагов
+        steps_remaining = max_steps - step_number
         steps_warning = ""
-        if step_number > max_steps * 0.8:
-            steps_warning = f"\n⚠️  WARNING: Only {max_steps - step_number} steps remaining! Consider completing soon."
+        if steps_remaining <= 3:
+            steps_warning = f"\n⚠️  Only {steps_remaining} steps left! Consider completing."
 
-        # Создаём промпт
+        # Подсказка от Vision Agent
+        hint_section = ""
+        if vision_analysis.next_action_hint:
+            hint_section = f"\nVision Agent suggests: {vision_analysis.next_action_hint}"
+
+        # Промпт
         user_message = f"""GOAL: {goal}
 
-PROGRESS: Step {step_number}/{max_steps}{steps_warning}
+PROGRESS: Step {step_number}/{max_steps}{steps_warning}{loop_warning}
 
 VISION ANALYSIS:
-Type: {vision_analysis.page_type} (confidence: {vision_analysis.confidence:.2f})
-Context: {vision_analysis.context}
+- Page type: {vision_analysis.page_type}
+- Confidence: {vision_analysis.confidence:.2f}
+- Context: {vision_analysis.context}{hint_section}
 
 Observations:
 {chr(10).join('  • ' + obs for obs in vision_analysis.observations)}
 
-AVAILABLE ELEMENTS:
+AVAILABLE ELEMENTS (sorted by priority):
 {elements_str}
 
 ACTION HISTORY:
 {history_str}
 
-What action should I take next to achieve the goal?"""
+Decide next action to achieve the goal."""
 
         try:
-            # Получаем решение
             response = await self.llm.generate_simple(
                 user_message=user_message,
                 system_prompt=self.SYSTEM_PROMPT
             )
 
-            # Парсим
             data = self._parse_json_response(response.content)
-
             if not data:
-                print("⚠️  Action Agent: Could not parse JSON")
-                return None
+                print("⚠️  Action Agent: JSON parse failed")
+                return self._create_fallback_action(vision_analysis, relevant_elements)
 
             # Показываем размышления
             if 'thinking' in data:
-                thinking = data['thinking']
-                print(f"💭 {thinking[:120]}{'...' if len(thinking) > 120 else ''}")
+                thinking = data['thinking'][:150]
+                print(f"💭 {thinking}{'...' if len(data['thinking']) > 150 else ''}")
 
-            # Валидируем
+            # Валидация
             is_valid, error = self._validate_action(data, element_ids)
             if not is_valid:
-                print(f"⚠️  Action Agent: Invalid action - {error}")
-                return None
+                print(f"⚠️  Invalid action: {error}")
+                return self._create_fallback_action(vision_analysis, relevant_elements)
 
             # Создаём действие
             action = Action.from_dict({
                 **data['action'],
                 'reasoning': data.get('reasoning', ''),
-                'confidence': data.get('confidence', 0.5)
+                'confidence': data.get('confidence', 0.5),
+                'expected_outcome': data.get('expected_outcome', '')
             })
+
+            # Проверяем на повтор неудачного действия
+            if action in self.failed_actions:
+                print("⚠️  Attempting previously failed action, trying fallback")
+                return self._create_fallback_action(vision_analysis, relevant_elements)
 
             # Сохраняем в историю
             self.action_history.append(action)
-
-            # Ограничиваем размер истории
-            if len(self.action_history) > self.max_history * 2:
-                self.action_history = self.action_history[-self.max_history:]
 
             return action
 
         except Exception as e:
             print(f"⚠️  Action Agent error: {e}")
-            return None
+            return self._create_fallback_action(vision_analysis, relevant_elements)
+
+    def _create_fallback_action(
+        self,
+        vision_analysis: PageAnalysis,
+        elements: List[Element]
+    ) -> Action:
+        """
+        Создаёт fallback действие на основе эвристик.
+        """
+        # Если есть элементы с высоким приоритетом, кликаем на первый
+        if vision_analysis.element_priorities:
+            top_elem = max(
+                vision_analysis.element_priorities.items(),
+                key=lambda x: x[1]
+            )[0]
+
+            return Action(
+                type='click',
+                params={'element_id': top_elem},
+                reasoning='Fallback: clicking highest priority element',
+                confidence=0.4
+            )
+
+        # Иначе просто ждём
+        return Action(
+            type='wait',
+            params={'seconds': 2},
+            reasoning='Fallback: waiting',
+            confidence=0.3
+        )
 
     def mark_action_failed(self, action: Action):
         """Помечает действие как неуспешное"""
@@ -445,22 +476,27 @@ What action should I take next to achieve the goal?"""
 
     def reset_history(self):
         """Сбрасывает историю"""
-        self.action_history = []
-        self.failed_actions = []
+        self.action_history.clear()
+        self.failed_actions.clear()
+        self.page_visit_count.clear()
 
     def get_stats(self) -> Dict[str, Any]:
-        """Возвращает статистику работы агента"""
+        """Статистика работы"""
         if not self.action_history:
             return {"total_actions": 0}
 
         action_types = Counter(a.type for a in self.action_history)
         avg_confidence = sum(a.confidence for a in self.action_history) / len(self.action_history)
 
+        is_loop, loop_type = self._detect_loop()
+
         return {
             "total_actions": len(self.action_history),
             "failed_actions": len(self.failed_actions),
-            "success_rate": 1.0 - (len(self.failed_actions) / len(self.action_history)),
+            "success_rate": 1.0 - (len(self.failed_actions) / len(self.action_history)) if self.action_history else 0.0,
             "average_confidence": avg_confidence,
             "action_types": dict(action_types),
-            "loop_detected": self._detect_loop()
+            "loop_detected": is_loop,
+            "loop_type": loop_type,
+            "page_revisits": dict(self.page_visit_count.most_common(3))
         }

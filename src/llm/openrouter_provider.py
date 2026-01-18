@@ -245,7 +245,7 @@ class ReasoningMessage(Message):
 # Вспомогательная функция для удобного создания
 async def create_openrouter_provider(
         model: str = "openai/gpt-oss-20b:free",
-        api_key: Optional[str] = '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',
+        api_key: Optional[str] = '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',
         enable_reasoning: bool = False,
         **kwargs
 ) -> OpenRouterProvider:
