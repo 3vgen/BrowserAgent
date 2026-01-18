@@ -10,7 +10,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 
-from ..llm.base import BaseLLMProvider
+from src.llm.base import BaseLLMProvider
 
 
 class StepStatus(Enum):
@@ -326,15 +326,16 @@ Be strict - only mark as completed if success criteria is clearly met."""
 # Тест
 if __name__ == "__main__":
     import asyncio
-    from ..llm.ollama_provider import create_ollama_provider
-
+    from src.llm.ollama_provider_request import create_ollama_provider
+    from src.llm.openrouter_provider import create_openrouter_provider
 
     async def test_planning():
         print("\n" + "=" * 80)
         print("PLANNING AGENT TEST")
         print("=" * 80)
 
-        llm = await create_ollama_provider(model="qwen2.5:7b")
+        # llm = await create_ollama_provider(model="qwen2.5:7b")
+        llm = await create_openrouter_provider(model="mistralai/devstral-2512:free")
         planner = PlanningAgent(llm_provider=llm)
 
         # Тест 1: Простая задача

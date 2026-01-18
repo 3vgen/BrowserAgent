@@ -9,7 +9,9 @@ from pathlib import Path
 # Добавляем src в path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.llm.ollama_provider import create_ollama_provider
+from src.llm.ollama_provider_request import create_ollama_provider
+from src.llm.openrouter_provider import create_openrouter_provider
+
 from src.browser.manager import BrowserManager
 from src.agents.orchestrator import Orchestrator
 
@@ -42,7 +44,9 @@ async def main():
     try:
         # LLM
         print("📍 Setting up LLM provider...")
-        llm = await create_ollama_provider(model=MODEL)
+        # llm = await create_ollama_provider(model=MODEL)
+        llm = await create_openrouter_provider(model='mistralai/devstral-2512:free')
+
         print("✅ LLM ready")
 
         # Browser

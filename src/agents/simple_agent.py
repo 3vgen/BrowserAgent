@@ -344,7 +344,7 @@ What should I do next to achieve the goal?"""
 # Пример использования
 if __name__ == "__main__":
     import asyncio
-    from src.llm.ollama_provider import create_ollama_provider
+    from src.llm.ollama_provider_request import create_ollama_provider
     from src.browser.manager import BrowserManager
 
 
