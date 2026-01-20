@@ -1,11 +1,10 @@
 """
-Action Agent - оптимизированное принятие решений
+Action Agent - с улучшенной защитой от ошибок
 
-Ключевые улучшения:
-- Интеграция с приоритетами элементов от Vision Agent
-- Умная детекция зацикливания с адаптацией
-- Предсказание успешности действия
-- Graceful degradation при проблемах
+Критические исправления:
+1. Не пытаемся набирать текст в submit/button элементы
+2. Строгая детекция зацикливания на ошибках
+3. Альтернативные стратегии при повторяющихся ошибках
 """
 
 import json
@@ -25,7 +24,8 @@ class Action:
     params: Dict[str, Any]
     reasoning: str = ""
     confidence: float = 0.0
-    expected_outcome: str = ""  # Что ожидаем после действия
+    expected_outcome: str = ""
+    subtask_complete: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'Action':
@@ -34,41 +34,69 @@ class Action:
             params=data.get('params', {}),
             reasoning=data.get('reasoning', ''),
             confidence=data.get('confidence', 0.5),
-            expected_outcome=data.get('expected_outcome', '')
+            expected_outcome=data.get('expected_outcome', ''),
+            subtask_complete=data.get('subtask_complete', False)
         )
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
     def __repr__(self) -> str:
-        return f"<Action {self.type} conf={self.confidence:.2f}>"
+        complete_marker = " [COMPLETE]" if self.subtask_complete else ""
+        return f"<Action {self.type} conf={self.confidence:.2f}{complete_marker}>"
 
     def signature(self) -> str:
-        """Уникальная сигнатура действия для детекции повторов"""
+        """Уникальная сигнатура действия"""
         return f"{self.type}:{json.dumps(self.params, sort_keys=True)}"
 
 
 class ActionAgent:
-    """
-    Оптимизированный Action Agent с адаптивным поведением.
-    """
+    """Action Agent с защитой от зацикливания"""
 
-    SYSTEM_PROMPT = """You are an Action Agent deciding browser actions to accomplish goals.
+    SYSTEM_PROMPT = """You are an Action Agent deciding browser actions to accomplish SUBTASKS.
 
-You receive analysis from Vision Agent including:
+CRITICAL ELEMENT TYPE RULES:
+1. NEVER use "type" action on elements with type="submit" or type="button"
+2. NEVER use "type" action on <button> tags
+3. For typing text, ONLY use elements with:
+   - tag="input" AND type in ["text", "search", "email", "tel"]
+   - tag="textarea"
+4. Use "click" for buttons and submit inputs
+5. Use "click" for links
+
+If you see an error like "Input of type submit cannot be filled":
+- This means you tried to type into a button
+- Look for the ACTUAL input field (usually nearby)
+- Use "type" action on the input field
+- Then "click" the submit button OR "press" Enter key
+
+CRITICAL CONTEXT:
+- You receive a CURRENT SUBTASK - focus ONLY on this specific subtask
+- You also receive TASK CONTEXT showing what's already done and what's remaining
+- Your job is to complete the CURRENT SUBTASK, not the entire goal
+
+Vision Agent provides:
 - page_type: type of current page
 - relevant_elements: element IDs with priorities
 - observations: factual observations about the page
 - next_action_hint: optional suggestion
+- subtask_achieved: whether Vision Agent thinks subtask is done
 - confidence: Vision Agent's confidence
 
 CRITICAL RULES:
-1. Use ONLY element IDs from relevant_elements
-2. If Vision Agent suggests page_type="article" AND confidence > 0.85 AND observations indicate goal is achieved → use "complete"
-3. Consider element priorities (higher priority = more relevant)
-4. Avoid repeating failed actions
-5. If stuck after 3 similar attempts, try different approach or complete with partial result
-6. expected_outcome helps verify if action succeeded
+1. Focus ONLY on the CURRENT SUBTASK (ignore overall goal and future subtasks)
+2. Use ONLY element IDs from relevant_elements
+3. Set subtask_complete=true when you believe the current subtask is finished
+4. Consider element priorities (higher priority = more relevant)
+5. Avoid repeating failed actions
+6. If stuck after 3 similar attempts, try DIFFERENT approach or mark complete
+
+WHEN TO SET subtask_complete=true:
+- Vision Agent says subtask_achieved=true AND you take a confirming action (like "wait")
+- After clicking "Add to cart" for "Add X to cart" subtask
+- After pressing Enter for "Search for X" subtask
+- After page loads for "Navigate to X" subtask
+- When clear visual confirmation appears
 
 AVAILABLE ACTIONS:
 - navigate: {"type": "navigate", "params": {"url": "https://..."}}
@@ -77,26 +105,37 @@ AVAILABLE ACTIONS:
 - press: {"type": "press", "params": {"key": "Enter"}}
 - scroll: {"type": "scroll", "params": {"direction": "down", "amount": 500}}
 - wait: {"type": "wait", "params": {"seconds": 2}}
-- complete: {"type": "complete", "params": {"result": "description of what was achieved"}}
 
 RESPONSE FORMAT (strict JSON):
 {
-  "thinking": "analyze situation step-by-step",
+  "thinking": "analyze CURRENT SUBTASK step-by-step, check element types!",
   "action": {
-    "type": "click",
-    "params": {"element_id": "elem_5"}
+    "type": "type",
+    "params": {"element_id": "elem_5", "text": "search query"}
   },
-  "reasoning": "why this action helps achieve goal",
+  "reasoning": "why this helps complete CURRENT SUBTASK",
   "confidence": 0.85,
-  "expected_outcome": "what should happen after this action"
+  "expected_outcome": "what should happen",
+  "subtask_complete": false
 }
 
 DECISION STRATEGY:
-1. Check if goal is already achieved (complete immediately)
-2. If Vision Agent has next_action_hint, consider it
-3. Prioritize elements with higher priority scores
-4. If previous action failed, try alternative approach
-5. If making no progress, consider completing with partial result
+1. Check if Vision Agent says subtask_achieved=true
+2. Check element types before deciding to "type"
+3. If you see "cannot be filled" error in history - find the REAL input field
+4. Prioritize elements with higher priority scores
+5. If previous action failed, try alternative approach
+6. If stuck: scroll, wait, or navigate directly
+
+EXAMPLES:
+
+Correct:
+elem_5 INPUT(text) "search box" → type "query" into elem_5 ✅
+elem_3 BUTTON(submit) "Search" → click elem_3 ✅
+
+Wrong:
+elem_3 BUTTON(submit) → type "query" into elem_3 ❌ (will fail!)
+Instead: find INPUT(text) field first
 
 Return ONLY valid JSON, no markdown."""
 
@@ -112,7 +151,8 @@ Return ONLY valid JSON, no markdown."""
 
         self.action_history: deque = deque(maxlen=max_history * 2)
         self.failed_actions: List[Action] = []
-        self.page_visit_count: Counter = Counter()  # Счётчик посещений страниц
+        self.page_visit_count: Counter = Counter()
+        self.error_count_by_type: Counter = Counter()  # НОВОЕ: счётчик ошибок по типу
 
     def _parse_json_response(self, text: str) -> Optional[Dict]:
         """Надёжный парсинг JSON"""
@@ -121,13 +161,11 @@ Return ONLY valid JSON, no markdown."""
 
         text = text.strip().replace('```json', '').replace('```', '').strip()
 
-        # Прямой парсинг
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Извлечение между { }
         try:
             start = text.find('{')
             end = text.rfind('}') + 1
@@ -141,9 +179,10 @@ Return ONLY valid JSON, no markdown."""
     def _validate_action(
         self,
         data: Dict,
-        available_element_ids: List[str]
+        available_element_ids: List[str],
+        all_elements: List[Element]  # НОВОЕ: для проверки типов
     ) -> Tuple[bool, str]:
-        """Валидация действия"""
+        """Валидация действия с проверкой типов элементов"""
         if 'action' not in data:
             return False, "Missing 'action' field"
 
@@ -154,18 +193,34 @@ Return ONLY valid JSON, no markdown."""
         action_type = action['type']
         params = action['params']
 
-        # Валидация по типу
-        if action_type in ['click', 'type']:
+        # КРИТИЧНО: Проверяем тип action "type"
+        if action_type == 'type':
             if 'element_id' not in params:
-                return False, f"{action_type} requires element_id"
+                return False, "type requires element_id"
 
             elem_id = params['element_id']
             if elem_id not in available_element_ids:
                 return False, f"element_id {elem_id} not available"
 
-        elif action_type == 'type':
+            # НОВОЕ: Проверяем что это не кнопка
+            elem = next((e for e in all_elements if e.id == elem_id), None)
+            if elem:
+                if elem.tag == 'button':
+                    return False, f"Cannot type into <button> element {elem_id}. Use 'click' instead."
+
+                if elem.tag == 'input' and elem.type in ['submit', 'button', 'reset']:
+                    return False, f"Cannot type into input[type='{elem.type}'] {elem_id}. Use 'click' instead."
+
             if 'text' not in params:
                 return False, "type requires text"
+
+        elif action_type == 'click':
+            if 'element_id' not in params:
+                return False, "click requires element_id"
+
+            elem_id = params['element_id']
+            if elem_id not in available_element_ids:
+                return False, f"element_id {elem_id} not available"
 
         elif action_type == 'navigate':
             if 'url' not in params:
@@ -185,21 +240,13 @@ Return ONLY valid JSON, no markdown."""
         elif action_type == 'wait':
             params.setdefault('seconds', 2)
 
-        elif action_type == 'complete':
-            params.setdefault('result', 'Task completed')
-
-        elif action_type not in ['wait', 'complete']:
+        elif action_type not in ['wait']:
             return False, f"Unknown action type: {action_type}"
 
         return True, ""
 
     def _detect_loop(self) -> Tuple[bool, Optional[str]]:
-        """
-        Детектирует зацикливание.
-
-        Returns:
-            (is_loop, loop_type)
-        """
+        """Детектирует зацикливание"""
         if len(self.action_history) < self.loop_detection_window:
             return False, None
 
@@ -211,14 +258,20 @@ Return ONLY valid JSON, no markdown."""
         if any(count >= 3 for count in sig_counts.values()):
             return True, "repeated_action"
 
-        # Тип 2: Цикл из 2-3 действий (A→B→A→B)
+        # Тип 2: Цикл из 2-3 действий
         if len(set(signatures)) <= 2:
             return True, "action_cycle"
 
-        # Тип 3: Все действия одного типа (только клики)
+        # Тип 3: Все действия одного типа
         action_types = [a.type for a in recent]
         if len(set(action_types)) == 1 and action_types[0] != 'wait':
             return True, "same_type_spam"
+
+        # НОВОЕ: Тип 4: Повторяющиеся ошибки одного типа
+        if self.error_count_by_type.most_common(1):
+            most_common_error, count = self.error_count_by_type.most_common(1)[0]
+            if count >= 3:
+                return True, f"repeated_error: {most_common_error}"
 
         return False, None
 
@@ -227,11 +280,10 @@ Return ONLY valid JSON, no markdown."""
         elements: List[Element],
         priorities: Dict[str, float]
     ) -> str:
-        """Форматирует элементы с учётом приоритетов"""
+        """Форматирует элементы с типами и приоритетами"""
         if not elements:
             return "No elements available"
 
-        # Сортируем по приоритету
         sorted_elements = sorted(
             elements,
             key=lambda e: priorities.get(e.id, 0.0),
@@ -239,11 +291,26 @@ Return ONLY valid JSON, no markdown."""
         )
 
         lines = []
-        for elem in sorted_elements[:12]:  # Топ 12
+        for elem in sorted_elements[:12]:
             priority = priorities.get(elem.id, 0.0)
             priority_marker = "★★★" if priority > 0.8 else "★★" if priority > 0.6 else "★"
 
-            parts = [f"{priority_marker} [{elem.id}]", elem.tag.upper()]
+            parts = [f"{priority_marker} [{elem.id}]"]
+
+            # КРИТИЧНО: Явно показываем тип
+            if elem.tag == 'input':
+                if elem.type in ['submit', 'button']:
+                    parts.append("BUTTON(submit)")
+                elif elem.type in ['text', 'search', 'email']:
+                    parts.append("INPUT(text)")
+                else:
+                    parts.append(f"INPUT({elem.type})")
+            elif elem.tag == 'button':
+                parts.append("BUTTON")
+            elif elem.tag == 'a':
+                parts.append("LINK")
+            else:
+                parts.append(elem.tag.upper())
 
             if elem.text:
                 text = elem.text[:35].replace('\n', ' ').strip()
@@ -253,17 +320,14 @@ Return ONLY valid JSON, no markdown."""
             if elem.placeholder:
                 parts.append(f'ph:"{elem.placeholder[:20]}"')
 
-            if elem.type:
-                parts.append(f't:{elem.type}')
-
             lines.append(' '.join(parts))
 
         return '\n'.join(lines)
 
     def _format_history_compact(self) -> str:
-        """Компактное форматирование истории"""
+        """Компактное форматирование истории с ошибками"""
         if not self.action_history:
-            return "No previous actions"
+            return "No previous actions for current subtask"
 
         recent = list(self.action_history)[-self.max_history:]
         lines = []
@@ -278,6 +342,9 @@ Return ONLY valid JSON, no markdown."""
             if action.type in ['click', 'type']:
                 elem_id = action.params.get('element_id', '?')
                 action_desc += f"({elem_id})"
+            elif action.type == 'type':
+                text = action.params.get('text', '')[:20]
+                action_desc += f'("{text}")'
 
             lines.append(f"{i}. {marker}{conf_marker} {action_desc}")
 
@@ -285,115 +352,82 @@ Return ONLY valid JSON, no markdown."""
         is_loop, loop_type = self._detect_loop()
         if is_loop:
             lines.append(f"\n⚠️  LOOP DETECTED: {loop_type}")
+            lines.append("   → Try DIFFERENT approach (scroll, navigate directly, or try other elements)!")
 
         return '\n'.join(lines)
 
-    def _should_complete_early(
-        self,
-        goal: str,
-        vision_analysis: PageAnalysis
-    ) -> Tuple[bool, str]:
-        """
-        Определяет, достигнута ли цель (ранее завершение).
-
-        Returns:
-            (should_complete, reason)
-        """
-        # Высокая уверенность Vision Agent + тип страницы соответствует цели
-        if vision_analysis.confidence > 0.85:
-            page_type = vision_analysis.page_type
-
-            # Если ищем статью и попали на статью
-            if page_type == 'article':
-                # Проверяем observations на совпадение с целью
-                obs_text = ' '.join(vision_analysis.observations).lower()
-                goal_lower = goal.lower()
-
-                # Простая эвристика: есть ли ключевые слова из цели в наблюдениях
-                goal_keywords = set(goal_lower.split()) - {'find', 'search', 'look', 'for', 'the', 'a', 'an'}
-                if any(keyword in obs_text for keyword in goal_keywords):
-                    return True, f"Found article matching goal (confidence: {vision_analysis.confidence:.2f})"
-
-            # Если ищем профиль и попали на профиль
-            if page_type == 'profile' and 'profile' in goal.lower():
-                return True, f"Reached profile page (confidence: {vision_analysis.confidence:.2f})"
-
-        return False, ""
-
     async def decide_action(
         self,
-        goal: str,
+        current_subtask: str,
+        task_context: str,
         vision_analysis: PageAnalysis,
         relevant_elements: List[Element],
         step_number: int,
         max_steps: int,
         current_url: str = ""
     ) -> Optional[Action]:
-        """
-        Принимает решение о следующем действии.
-        """
-        # Проверяем раннее завершение
-        should_complete, complete_reason = self._should_complete_early(goal, vision_analysis)
-        if should_complete:
-            print(f"✓ Early completion: {complete_reason}")
-            return Action(
-                type='complete',
-                params={'result': complete_reason},
-                reasoning=complete_reason,
-                confidence=vision_analysis.confidence
-            )
-
-        # Отслеживаем посещения страниц
+        """Принимает решение о следующем действии"""
         if current_url:
             self.page_visit_count[current_url] += 1
-            if self.page_visit_count[current_url] > 3:
-                print(f"⚠️  Visited {current_url} {self.page_visit_count[current_url]} times")
+            if self.page_visit_count[current_url] > 5:
+                print(f"⚠️  Visited {current_url} {self.page_visit_count[current_url]} times - consider navigation!")
 
-        # Форматируем элементы с приоритетами
         elements_str = self._format_elements_with_priorities(
             relevant_elements,
             vision_analysis.element_priorities or {}
         )
         element_ids = [e.id for e in relevant_elements]
 
-        # История
         history_str = self._format_history_compact()
 
-        # Детекция зацикливания
         is_loop, loop_type = self._detect_loop()
-        loop_warning = f"\n⚠️  LOOP DETECTED ({loop_type}): Try different approach or complete!" if is_loop else ""
+        loop_warning = ""
+        if is_loop:
+            loop_warning = f"\n⚠️  CRITICAL: LOOP DETECTED ({loop_type})!\n   You MUST try a DIFFERENT approach!"
 
-        # Предупреждение о лимите шагов
+            # Сбрасываем счётчики ошибок при детекции цикла
+            if "repeated_error" in str(loop_type):
+                self.error_count_by_type.clear()
+
         steps_remaining = max_steps - step_number
         steps_warning = ""
         if steps_remaining <= 3:
-            steps_warning = f"\n⚠️  Only {steps_remaining} steps left! Consider completing."
+            steps_warning = f"\n⚠️  Only {steps_remaining} steps left for this subtask!"
 
-        # Подсказка от Vision Agent
         hint_section = ""
         if vision_analysis.next_action_hint:
             hint_section = f"\nVision Agent suggests: {vision_analysis.next_action_hint}"
 
-        # Промпт
-        user_message = f"""GOAL: {goal}
+        vision_complete = ""
+        if vision_analysis.subtask_achieved:
+            vision_complete = f"\n✓ Vision Agent signals: subtask appears ACHIEVED!"
 
-PROGRESS: Step {step_number}/{max_steps}{steps_warning}{loop_warning}
+        user_message = f"""{task_context}
+
+{'-' * 60}
 
 VISION ANALYSIS:
 - Page type: {vision_analysis.page_type}
 - Confidence: {vision_analysis.confidence:.2f}
+- Subtask achieved: {vision_analysis.subtask_achieved}{vision_complete}
 - Context: {vision_analysis.context}{hint_section}
 
 Observations:
 {chr(10).join('  • ' + obs for obs in vision_analysis.observations)}
 
-AVAILABLE ELEMENTS (sorted by priority):
+AVAILABLE ELEMENTS (with explicit types!):
 {elements_str}
 
-ACTION HISTORY:
+RECENT ACTIONS:
 {history_str}
 
-Decide next action to achieve the goal."""
+Step {step_number}/{max_steps}{steps_warning}{loop_warning}
+
+Remember: Check element TYPES before deciding action!
+- Use "type" ONLY for INPUT(text) elements
+- Use "click" for BUTTON or BUTTON(submit) elements
+
+Decide next action to complete the CURRENT SUBTASK."""
 
         try:
             response = await self.llm.generate_simple(
@@ -406,31 +440,36 @@ Decide next action to achieve the goal."""
                 print("⚠️  Action Agent: JSON parse failed")
                 return self._create_fallback_action(vision_analysis, relevant_elements)
 
-            # Показываем размышления
             if 'thinking' in data:
                 thinking = data['thinking'][:150]
                 print(f"💭 {thinking}{'...' if len(data['thinking']) > 150 else ''}")
 
-            # Валидация
-            is_valid, error = self._validate_action(data, element_ids)
+            # Валидация с проверкой типов
+            is_valid, error = self._validate_action(data, element_ids, relevant_elements)
             if not is_valid:
                 print(f"⚠️  Invalid action: {error}")
+
+                # Запоминаем тип ошибки
+                if "Cannot type into" in error:
+                    self.error_count_by_type["type_into_button"] += 1
+
                 return self._create_fallback_action(vision_analysis, relevant_elements)
 
-            # Создаём действие
             action = Action.from_dict({
                 **data['action'],
                 'reasoning': data.get('reasoning', ''),
                 'confidence': data.get('confidence', 0.5),
-                'expected_outcome': data.get('expected_outcome', '')
+                'expected_outcome': data.get('expected_outcome', ''),
+                'subtask_complete': data.get('subtask_complete', False)
             })
 
-            # Проверяем на повтор неудачного действия
+            if action.subtask_complete:
+                print(f"✓ Action Agent signals: SUBTASK COMPLETE")
+
             if action in self.failed_actions:
                 print("⚠️  Attempting previously failed action, trying fallback")
                 return self._create_fallback_action(vision_analysis, relevant_elements)
 
-            # Сохраняем в историю
             self.action_history.append(action)
 
             return action
@@ -444,10 +483,36 @@ Decide next action to achieve the goal."""
         vision_analysis: PageAnalysis,
         elements: List[Element]
     ) -> Action:
-        """
-        Создаёт fallback действие на основе эвристик.
-        """
-        # Если есть элементы с высоким приоритетом, кликаем на первый
+        """Создаёт fallback действие"""
+        if vision_analysis.subtask_achieved:
+            return Action(
+                type='wait',
+                params={'seconds': 1},
+                reasoning='Vision Agent confirms subtask achieved',
+                confidence=0.8,
+                subtask_complete=True
+            )
+
+        # Ищем НАСТОЯЩЕЕ input поле
+        text_inputs = [
+            e for e in elements
+            if e.tag == 'input' and e.type in ['text', 'search', 'email', 'tel']
+        ]
+
+        if text_inputs and vision_analysis.element_priorities:
+            # Берём input с наивысшим приоритетом
+            top_input = max(
+                text_inputs,
+                key=lambda e: vision_analysis.element_priorities.get(e.id, 0.0)
+            )
+
+            return Action(
+                type='scroll',
+                params={'direction': 'down', 'amount': 300},
+                reasoning='Fallback: scrolling to reveal more elements',
+                confidence=0.3
+            )
+
         if vision_analysis.element_priorities:
             top_elem = max(
                 vision_analysis.element_priorities.items(),
@@ -461,7 +526,6 @@ Decide next action to achieve the goal."""
                 confidence=0.4
             )
 
-        # Иначе просто ждём
         return Action(
             type='wait',
             params={'seconds': 2},
@@ -479,6 +543,7 @@ Decide next action to achieve the goal."""
         self.action_history.clear()
         self.failed_actions.clear()
         self.page_visit_count.clear()
+        self.error_count_by_type.clear()
 
     def get_stats(self) -> Dict[str, Any]:
         """Статистика работы"""
@@ -498,5 +563,6 @@ Decide next action to achieve the goal."""
             "action_types": dict(action_types),
             "loop_detected": is_loop,
             "loop_type": loop_type,
-            "page_revisits": dict(self.page_visit_count.most_common(3))
+            "page_revisits": dict(self.page_visit_count.most_common(3)),
+            "error_types": dict(self.error_count_by_type)
         }

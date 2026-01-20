@@ -1,10 +1,11 @@
 """
-Orchestrator - УЛУЧШЕННЫЙ координатор с планированием
+Orchestrator - координатор с Planning Agent
 
-Новые возможности:
-- Planning Agent для разбивки задач
+Архитектура:
+- Planning Agent для декомпозиции задач
+- Vision Agent анализирует в контексте текущего шага
+- Action Agent фокусируется на текущем шаге
 - Детальное логирование
-- Умная детекция завершения
 - Адаптивное поведение при зацикливании
 """
 
@@ -28,31 +29,27 @@ class TaskResult:
     result: str
     steps_completed: int
     total_time: float
+    plan_steps_completed: int = 0
+    plan_steps_total: int = 0
     error: Optional[str] = None
     stats: Optional[Dict] = None
 
     def __repr__(self) -> str:
         status = "✅" if self.success else "❌"
-        return f"<TaskResult {status} steps={self.steps_completed} time={self.total_time:.1f}s>"
+        return f"<TaskResult {status} plan={self.plan_steps_completed}/{self.plan_steps_total} steps={self.steps_completed} time={self.total_time:.1f}s>"
 
 
 class Orchestrator:
     """
-    Улучшенный оркестратор с планированием и логированием.
-
-    Основные улучшения:
-    1. Planning Agent - создаёт план перед выполнением
-    2. Следование плану - агент знает что делать дальше
-    3. Детекция завершения шагов - не делает лишнего
-    4. Полное логирование - все размышления в файл
-    5. Адаптивное поведение - меняет стратегию при зацикливании
+    Оркестратор с Planning Agent для многошаговых задач.
     """
 
     def __init__(
         self,
         llm_provider: BaseLLMProvider,
         browser: BrowserManager,
-        max_steps: int = 30,
+        max_steps_per_plan_step: int = 10,
+        max_total_steps: int = 50,
         verbose: bool = True,
         use_planning: bool = True,
         logger: Optional[AgentLogger] = None
@@ -61,20 +58,22 @@ class Orchestrator:
         Args:
             llm_provider: LLM провайдер
             browser: Менеджер браузера
-            max_steps: Максимум шагов
+            max_steps_per_plan_step: Максимум действий на один шаг плана
+            max_total_steps: Максимум действий всего
             verbose: Показывать логи в консоль
             use_planning: Использовать Planning Agent
-            logger: Внешний логгер (если None - создаст свой)
+            logger: Внешний логгер
         """
         self.browser = browser
-        self.max_steps = max_steps
+        self.max_steps_per_plan_step = max_steps_per_plan_step
+        self.max_total_steps = max_total_steps
         self.verbose = verbose
         self.use_planning = use_planning
 
         # Логгер
         self.logger = logger if logger else create_session_logger()
 
-        # Sub-агенты
+        # Агенты
         self.vision_agent = VisionAgent(llm_provider=llm_provider)
         self.action_agent = ActionAgent(llm_provider=llm_provider)
 
@@ -85,6 +84,8 @@ class Orchestrator:
 
         # Состояние
         self.current_plan: Optional[TaskPlan] = None
+        self.total_steps = 0
+        self.plan_step_actions = 0
         self.consecutive_errors = 0
         self.loop_attempts = 0
 
@@ -93,96 +94,38 @@ class Orchestrator:
         if self.verbose:
             print(message)
 
-    async def _check_step_completion(
-        self,
-        current_step_description: str,
-        current_step_criteria: str
-    ) -> bool:
-        """
-        Проверяет завершён ли текущий шаг плана.
-
-        Args:
-            current_step_description: Описание шага
-            current_step_criteria: Критерии успеха
-
-        Returns:
-            True если шаг завершён
-        """
-        # Получаем текущее состояние
-        page_state = await self.browser.get_page_state()
-
-        # Формируем описание текущей ситуации
-        situation = f"""
-Page URL: {page_state['url']}
-Page Title: {page_state['title']}
-Elements visible: {len([e for e in page_state['elements'] if e.is_in_viewport])}
-"""
-
-        # Проверяем через Planning Agent
-        if self.planning_agent:
-            from ..agents.planning_agent import PlanStep
-            step = PlanStep(
-                step_number=0,
-                description=current_step_description,
-                success_criteria=current_step_criteria
-            )
-
-            is_complete = await self.planning_agent.should_step_be_complete(
-                step,
-                situation
-            )
-
-            return is_complete
-
-        return False
-
     async def _execute_action_safe(self, action: Action) -> Dict[str, Any]:
         """Выполняет действие с логированием"""
-
         action_type = action.type
         params = action.params
 
         self.logger.log_action_execution(action_type, True, retry_attempt=0)
 
         try:
-            # Навигация
             if action_type == "navigate":
                 url = params.get("url")
                 result = await self.browser.navigate(url)
 
-            # Клик
             elif action_type == "click":
                 element_id = params.get("element_id")
                 result = await self.browser.click(element_id)
 
-            # Ввод
             elif action_type == "type":
                 element_id = params.get("element_id")
                 text = params.get("text")
                 result = await self.browser.type_text(element_id, text)
 
-            # Нажатие клавиши
             elif action_type == "press":
                 key = params.get("key", "Enter")
                 result = await self.browser.press_key(key)
 
-            # Прокрутка
             elif action_type == "scroll":
                 direction = params.get("direction", "down")
                 result = await self.browser.scroll(direction)
 
-            # Ожидание
             elif action_type == "wait":
                 seconds = params.get("seconds", 2)
                 result = await self.browser.wait(seconds)
-
-            # Завершение
-            elif action_type == "complete":
-                result = {
-                    "success": True,
-                    "completed": True,
-                    "result": params.get("result", "Task completed")
-                }
 
             else:
                 result = {
@@ -190,7 +133,6 @@ Elements visible: {len([e for e in page_state['elements'] if e.is_in_viewport])}
                     "error": f"Unknown action: {action_type}"
                 }
 
-            # Логируем результат
             if result.get('success'):
                 self.logger.log_action_execution(action_type, True)
             else:
@@ -216,35 +158,45 @@ Elements visible: {len([e for e in page_state['elements'] if e.is_in_viewport])}
         start_url: Optional[str] = None
     ) -> TaskResult:
         """
-        Выполняет задачу с планированием.
-
-        Args:
-            goal: Цель
-            start_url: Начальный URL
-
-        Returns:
-            TaskResult
+        Выполняет задачу с декомпозицией на шаги.
         """
         start_time = time.time()
 
-        # Логируем цель
         self.logger.log_goal(goal)
+        self._log(f"\n{'='*70}")
+        self._log(f"🎯 GOAL: {goal}")
+        self._log(f"{'='*70}\n")
 
-        # Сбрасываем состояние
+        # Сброс состояния
         self.action_agent.reset_history()
+        self.total_steps = 0
+        self.plan_step_actions = 0
         self.consecutive_errors = 0
         self.loop_attempts = 0
 
-        # Шаг 1: Создаём план (если включено)
+        # Шаг 1: Создание плана
         if self.use_planning and self.planning_agent:
+            self._log("📋 Planning Agent: creating plan...")
+
             self.current_plan = await self.planning_agent.create_plan(goal)
 
-            if self.current_plan:
-                self.logger.log_plan({
-                    "steps": [s.to_dict() for s in self.current_plan.steps]
-                })
-            else:
-                self.logger.log_warning("Failed to create plan, proceeding without it")
+            if not self.current_plan:
+                elapsed = time.time() - start_time
+                error_msg = "Failed to create plan"
+                self.logger.log_error(error_msg)
+
+                return TaskResult(
+                    success=False,
+                    result="",
+                    steps_completed=0,
+                    total_time=elapsed,
+                    error=error_msg
+                )
+
+            # Логируем план
+            self.logger.log_plan({
+                "steps": [s.to_dict() for s in self.current_plan.steps]
+            })
 
         # Шаг 2: Начальная навигация
         if start_url:
@@ -265,210 +217,274 @@ Elements visible: {len([e for e in page_state['elements'] if e.is_in_viewport])}
                 )
 
         # Шаг 3: Основной цикл
-        for step in range(1, self.max_steps + 1):
-            self.logger.log_step_start(step, self.max_steps)
-
-            # Emergency stop
-            if self.consecutive_errors >= 5:
+        while self.total_steps < self.max_total_steps:
+            # Проверяем завершение плана
+            if self.current_plan and self.current_plan.is_completed():
                 elapsed = time.time() - start_time
-                error_msg = f"Emergency stop: {self.consecutive_errors} errors"
-                self.logger.log_error(error_msg)
+                progress = self.current_plan.get_progress()
+                result_msg = f"All {progress['total']} plan steps completed!"
+
+                self._log(f"\n{'='*70}")
+                self._log(f"✅ SUCCESS: {result_msg}")
+                self._log(f"{'='*70}\n")
+
+                self.logger.log_task_completion(
+                    True,
+                    result_msg,
+                    self.total_steps,
+                    elapsed,
+                    self.action_agent.get_stats()
+                )
 
                 return TaskResult(
-                    success=False,
-                    result="",
-                    steps_completed=step - 1,
+                    success=True,
+                    result=result_msg,
+                    steps_completed=self.total_steps,
                     total_time=elapsed,
-                    error=error_msg
+                    plan_steps_completed=progress['completed'],
+                    plan_steps_total=progress['total'],
+                    stats=self.action_agent.get_stats()
                 )
 
-            try:
-                # 1. Получаем состояние
-                page_state = await self.browser.get_page_state()
-                self.logger.log_page_state(
-                    page_state['url'],
-                    page_state['title'],
-                    len(page_state['elements'])
-                )
+            # Получаем текущий шаг плана
+            current_plan_step = None
+            if self.current_plan:
+                current_plan_step = self.current_plan.get_current_step()
 
-                # 2. Проверяем завершение шага плана (если есть план)
-                if self.current_plan and not self.current_plan.is_completed():
-                    current_step = self.current_plan.get_current_step()
+                if not current_plan_step:
+                    if self.current_plan.has_failed():
+                        elapsed = time.time() - start_time
+                        error_msg = "Some plan steps failed"
 
-                    if current_step and current_step.status == StepStatus.IN_PROGRESS:
-                        # Проверяем завершён ли шаг
-                        is_step_done = await self._check_step_completion(
-                            current_step.description,
-                            current_step.success_criteria
+                        return TaskResult(
+                            success=False,
+                            result="",
+                            steps_completed=self.total_steps,
+                            total_time=elapsed,
+                            error=error_msg,
+                            stats=self.action_agent.get_stats()
                         )
+                    break
 
-                        if is_step_done:
-                            self.current_plan.mark_step_completed()
-                            self.logger.log_step_completion(current_step.description)
+            # Выполняем итерацию текущего шага плана
+            step_result = await self._execute_plan_step_iteration(
+                current_plan_step.description if current_plan_step else goal,
+                current_plan_step.success_criteria if current_plan_step else "Goal achieved"
+            )
 
-                            # Если план завершён
-                            if self.current_plan.is_completed():
-                                elapsed = time.time() - start_time
-                                result_msg = "All plan steps completed successfully"
-
-                                self.logger.log_task_completion(
-                                    True,
-                                    result_msg,
-                                    step,
-                                    elapsed,
-                                    self.action_agent.get_stats()
-                                )
-
-                                return TaskResult(
-                                    success=True,
-                                    result=result_msg,
-                                    steps_completed=step,
-                                    total_time=elapsed,
-                                    stats=self.action_agent.get_stats()
-                                )
-
-                    # Помечаем текущий шаг как in_progress
-                    if current_step and current_step.status == StepStatus.PENDING:
-                        current_step.status = StepStatus.IN_PROGRESS
-
-                # 3. Vision Agent анализирует
-                self._log("\n👁️  Vision Agent analyzing...")
-
-                vision_analysis = await self.vision_agent.analyze_page(
-                    goal=goal,
-                    url=page_state['url'],
-                    title=page_state['title'],
-                    elements=page_state['elements']
-                )
-
-                self.logger.log_vision_analysis(
-                    vision_analysis.page_type,
-                    vision_analysis.confidence,
-                    vision_analysis.observations,
-                    len(vision_analysis.relevant_elements)
-                )
-
-                # Логируем размышления (если есть в raw_response)
-                if hasattr(vision_analysis, 'raw_response'):
-                    self.logger.log_thinking(
-                        "vision_agent",
-                        vision_analysis.raw_response,
-                        {
-                            "page_type": vision_analysis.page_type,
-                            "confidence": vision_analysis.confidence
-                        }
-                    )
-
-                # 4. Фильтруем элементы
-                relevant_elements = self.vision_agent.filter_elements(
-                    page_state['elements'],
-                    vision_analysis.relevant_elements
-                )
-
-                # 5. Action Agent решает
-                self._log("\n🤖 Action Agent deciding...")
-
-                # Добавляем контекст плана если есть
-                planning_context = ""
-                if self.current_plan and not self.current_plan.is_completed():
-                    current_step = self.current_plan.get_current_step()
-                    if current_step:
-                        planning_context = f"\nCURRENT PLAN STEP: {current_step.description}\nSUCCESS CRITERIA: {current_step.success_criteria}\n"
-
-                action = await self.action_agent.decide_action(
-                    goal=goal + planning_context,
-                    vision_analysis=vision_analysis,
-                    relevant_elements=relevant_elements,
-                    step_number=step,
-                    max_steps=self.max_steps
-                )
-
-                if not action:
-                    self.logger.log_error("Action Agent failed to decide")
-                    self.consecutive_errors += 1
-                    continue
-
-                # Логируем решение
-                self.logger.log_action_decision(
-                    action.type,
-                    action.params,
-                    action.reasoning,
-                    action.confidence
-                )
-
-                # 6. Детекция зацикливания
-                if self.action_agent._detect_loop():
-                    self.logger.log_loop_detected()
-                    self.loop_attempts += 1
-
-                    if self.loop_attempts >= 2:
-                        # Пробуем scroll или skip
-                        self._log("Trying to break loop with scroll...")
-                        await self.browser.scroll("down")
-                        self.loop_attempts = 0
-
-                # 7. Выполняем действие
-                result = await self._execute_action_safe(action)
-
-                # 8. Обрабатываем результат
-                if not result.get('success'):
-                    self.action_agent.mark_action_failed(action)
-                    self.consecutive_errors += 1
-
-                    # Помечаем шаг плана как failed
-                    if self.current_plan:
-                        current_step = self.current_plan.get_current_step()
-                        if current_step:
-                            self.current_plan.mark_step_failed()
-
-                    continue
-
-                # Успех
-                self.consecutive_errors = 0
-
-                # Проверяем завершение
-                if result.get('completed'):
-                    elapsed = time.time() - start_time
-                    result_msg = result.get('result', 'Task completed')
-
-                    self.logger.log_task_completion(
-                        True,
-                        result_msg,
-                        step,
-                        elapsed,
-                        self.action_agent.get_stats()
-                    )
-
-                    return TaskResult(
-                        success=True,
-                        result=result_msg,
-                        steps_completed=step,
-                        total_time=elapsed,
-                        stats=self.action_agent.get_stats()
-                    )
-
-                await asyncio.sleep(0.5)
-
-            except Exception as e:
-                self.logger.log_error(str(e), f"Step {step}")
+            # Обработка результата
+            if step_result.get('error'):
                 self.consecutive_errors += 1
 
-        # Достигли максимума
+                if self.consecutive_errors >= 5:
+                    elapsed = time.time() - start_time
+                    error_msg = f"Emergency stop: {self.consecutive_errors} errors"
+
+                    return TaskResult(
+                        success=False,
+                        result="",
+                        steps_completed=self.total_steps,
+                        total_time=elapsed,
+                        error=error_msg
+                    )
+            else:
+                self.consecutive_errors = 0
+
+            # Проверяем завершение шага плана
+            if step_result.get('step_complete'):
+                if self.current_plan and current_plan_step:
+                    self.current_plan.mark_step_completed(
+                        result=step_result.get('result', '')
+                    )
+
+                    # Сброс для нового шага
+                    self.plan_step_actions = 0
+                    self.action_agent.reset_history()
+                    self.logger.log_step_completion(current_plan_step.description)
+
+            # Лимит действий на шаг плана
+            elif self.plan_step_actions >= self.max_steps_per_plan_step:
+                self._log(f"⚠️  Max actions reached for current plan step")
+
+                if self.current_plan and current_plan_step:
+                    self.current_plan.mark_step_failed(
+                        reason=f"Max actions ({self.max_steps_per_plan_step}) reached"
+                    )
+
+                    if current_plan_step.is_failed():
+                        self._log(f"✗ Skipping failed plan step")
+                        self.plan_step_actions = 0
+                        self.action_agent.reset_history()
+
+        # Максимум шагов достигнут
         elapsed = time.time() - start_time
 
-        self.logger.log_task_completion(
-            False,
-            "Maximum steps reached",
-            self.max_steps,
-            elapsed,
-            self.action_agent.get_stats()
-        )
+        if self.current_plan:
+            progress = self.current_plan.get_progress()
 
-        return TaskResult(
-            success=False,
-            result="",
-            steps_completed=self.max_steps,
-            total_time=elapsed,
-            error="Maximum steps reached",
-            stats=self.action_agent.get_stats()
-        )
+            return TaskResult(
+                success=False,
+                result=f"Partial: {progress['completed']}/{progress['total']} steps",
+                steps_completed=self.total_steps,
+                total_time=elapsed,
+                plan_steps_completed=progress['completed'],
+                plan_steps_total=progress['total'],
+                error="Maximum steps reached",
+                stats=self.action_agent.get_stats()
+            )
+        else:
+            return TaskResult(
+                success=False,
+                result="",
+                steps_completed=self.total_steps,
+                total_time=elapsed,
+                error="Maximum steps reached",
+                stats=self.action_agent.get_stats()
+            )
+
+    async def _execute_plan_step_iteration(
+        self,
+        current_step_description: str,
+        success_criteria: str
+    ) -> Dict[str, Any]:
+        """
+        Выполняет одну итерацию текущего шага плана.
+        """
+        self.total_steps += 1
+        self.plan_step_actions += 1
+
+        self.logger.log_step_start(self.total_steps, self.max_total_steps)
+        self._log(f"\n{'─'*70}")
+        self._log(f"Action {self.total_steps}/{self.max_total_steps} (plan step action {self.plan_step_actions}/{self.max_steps_per_plan_step})")
+        self._log(f"{'─'*70}")
+
+        try:
+            # 1. Получаем состояние
+            page_state = await self.browser.get_page_state()
+
+            self.logger.log_page_state(
+                page_state['url'],
+                page_state['title'],
+                len(page_state['elements'])
+            )
+
+            # 2. Получаем контекст плана
+            task_context = ""
+            if self.current_plan:
+                task_context = self.current_plan.get_context_for_agents()
+
+            # 3. Vision Agent анализирует
+            self._log("\n👁️  Vision Agent analyzing...")
+
+            vision_analysis = await self.vision_agent.analyze_page(
+                goal=current_step_description,
+                url=page_state['url'],
+                title=page_state['title'],
+                elements=page_state['elements'],
+                task_context=task_context
+            )
+
+            self.logger.log_vision_analysis(
+                vision_analysis.page_type,
+                vision_analysis.confidence,
+                vision_analysis.observations,
+                len(vision_analysis.relevant_elements)
+            )
+
+            if hasattr(vision_analysis, 'raw_response'):
+                self.logger.log_thinking(
+                    "vision_agent",
+                    vision_analysis.raw_response,
+                    {
+                        "page_type": vision_analysis.page_type,
+                        "confidence": vision_analysis.confidence,
+                        "subtask_achieved": vision_analysis.subtask_achieved
+                    }
+                )
+
+            if vision_analysis.subtask_achieved:
+                self._log("✓ Vision Agent: step appears achieved")
+
+            # 4. Фильтруем элементы
+            relevant_elements = self.vision_agent.filter_elements(
+                page_state['elements'],
+                vision_analysis.relevant_elements
+            )
+
+            # 5. Action Agent решает
+            self._log("\n🤖 Action Agent deciding...")
+
+            action = await self.action_agent.decide_action(
+                current_subtask=current_step_description,
+                task_context=task_context,
+                vision_analysis=vision_analysis,
+                relevant_elements=relevant_elements,
+                step_number=self.plan_step_actions,
+                max_steps=self.max_steps_per_plan_step,
+                current_url=page_state['url']
+            )
+
+            if not action:
+                self.logger.log_error("Action Agent failed to decide")
+                return {'error': 'Action decision failed'}
+
+            self.logger.log_action_decision(
+                action.type,
+                action.params,
+                action.reasoning,
+                action.confidence
+            )
+
+            # 6. Детекция зацикливания
+            is_loop, loop_type = self.action_agent._detect_loop()
+            if is_loop:
+                self.logger.log_loop_detected()
+                self.loop_attempts += 1
+
+                if self.loop_attempts >= 2:
+                    self._log("⚠️  Breaking loop with scroll...")
+                    await self.browser.scroll("down")
+                    self.loop_attempts = 0
+
+            # 7. Выполняем действие
+            result = await self._execute_action_safe(action)
+
+            if not result.get('success'):
+                self.action_agent.mark_action_failed(action)
+                return {'error': result.get('error', 'Action failed')}
+
+            self.loop_attempts = 0
+
+            # 8. Проверяем завершение шага
+            step_complete = (
+                action.subtask_complete or
+                vision_analysis.subtask_achieved
+            )
+
+            if step_complete:
+                self._log("✅ Plan step marked as COMPLETE")
+
+            return {
+                'step_complete': step_complete,
+                'result': result.get('result', ''),
+                'error': None
+            }
+
+        except Exception as e:
+            self.logger.log_error(str(e), f"Action {self.total_steps}")
+            return {'error': str(e)}
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Статистика выполнения"""
+        stats = {
+            'total_steps': self.total_steps,
+            'action_agent': self.action_agent.get_stats()
+        }
+
+        if self.current_plan:
+            stats['plan'] = {
+                'steps': [s.to_dict() for s in self.current_plan.steps],
+                'progress': self.current_plan.get_progress()
+            }
+
+        return stats

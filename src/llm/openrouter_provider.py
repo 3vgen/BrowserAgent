@@ -1,7 +1,9 @@
+import os
+
 import httpx
 from typing import List, Optional, Dict, Any
 import json
-
+from src.utils.config import MODEL_NAME, API_KEY
 from src.llm.base import BaseLLMProvider, Message, LLMResponse, LLMProviderError
 
 
@@ -244,8 +246,8 @@ class ReasoningMessage(Message):
 
 # Вспомогательная функция для удобного создания
 async def create_openrouter_provider(
-        model: str = "openai/gpt-oss-20b:free",
-        api_key: Optional[str] = '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',
+        model: str = MODEL_NAME,
+        api_key: Optional[str] = API_KEY,
         enable_reasoning: bool = False,
         **kwargs
 ) -> OpenRouterProvider:

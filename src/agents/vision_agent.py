@@ -1,11 +1,10 @@
 """
-Vision Agent - оптимизированный анализ веб-страниц
+Vision Agent - HOTFIX версия
 
-Улучшения:
-- Более точные промпты
-- Лучший парсинг JSON
-- Умная фильтрация элементов
-- Кэширование результатов
+Критические исправления:
+1. Фильтрация submit/button элементов для type action
+2. Приоритет REAL input полям над кнопками
+3. Явное указание типов элементов в промпте
 """
 
 import json
@@ -28,6 +27,7 @@ class PageAnalysis:
     next_action_hint: Optional[str] = None
     element_priorities: Optional[Dict[str, float]] = None
     raw_response: str = ""
+    subtask_achieved: bool = False
 
     def __post_init__(self):
         if self.element_priorities is None:
@@ -54,16 +54,12 @@ class PageAnalysis:
 
 class VisionAgent:
     """
-    Оптимизированный Vision Agent с двухфазным анализом.
-
-    Фаза 1: Быстрый структурный анализ (определение типа страницы)
-    Фаза 2: Детальный анализ релевантных элементов
+    Vision Agent с улучшенной фильтрацией элементов.
     """
 
-    # Компактный промпт для фазы 1 (структурный анализ)
     STRUCTURE_PROMPT = """Analyze page structure and type. Return JSON:
 {
-  "page_type": "search_page|search_results|article|form|product|auth|email_inbox|email_list|vacancy_list|vacancy_detail|profile|other",
+  "page_type": "search_page|search_results|article|form|product|auth|email_inbox|email_list|vacancy_list|vacancy_detail|profile|cart|checkout|other",
   "key_sections": ["header", "main_content", "sidebar"],
   "interactive_count": 15,
   "confidence": 0.9
@@ -78,14 +74,21 @@ Page types:
 - vacancy_list: job listings
 - vacancy_detail: single job description
 - profile: user profile page
+- cart: shopping cart page
+- checkout: checkout/payment page
+- product: single product page
 
 Return ONLY JSON."""
 
-    # Детальный промпт для фазы 2 (анализ элементов)
-    DETAIL_PROMPT = """You are Vision Agent analyzing page elements for a goal.
+    DETAIL_PROMPT = """You are Vision Agent analyzing page elements for a SPECIFIC SUBTASK.
 
-CRITICAL: Your job is ONLY to identify relevant elements, NOT to decide actions.
-Action Agent will use your analysis to make decisions.
+CRITICAL ELEMENT TYPE AWARENESS:
+- INPUT fields: type="text", type="search", type="email" - CAN be typed into
+- BUTTON elements: type="submit", type="button", tag="button" - CANNOT be typed into (only clicked)
+- LINKS: tag="a" - can be clicked
+- SELECT: tag="select" - dropdowns
+
+NEVER suggest typing into buttons or submit inputs!
 
 Response format (strict JSON):
 {
@@ -98,20 +101,29 @@ Response format (strict JSON):
     "Clear factual observation 1",
     "Clear factual observation 2"
   ],
-  "next_action_hint": "Optional: suggest what type of action might help (click/type/scroll)",
+  "next_action_hint": "Optional: suggest what type of action might help",
+  "subtask_achieved": false,
   "confidence": 0.0-1.0,
   "context": "Additional context for Action Agent"
 }
 
+WHEN TO SET subtask_achieved=true:
+- Current subtask: "Navigate to X" → page URL/title matches X
+- Current subtask: "Search for X" → search results for X are visible
+- Current subtask: "Add X to cart" → cart shows X was added OR "added to cart" confirmation visible
+- Current subtask: "Open article about X" → article content about X is displayed
+- Current subtask: "Find vacancy for X" → vacancy details about X are shown
+
 Guidelines:
-1. Identify 3-10 elements most relevant to the goal
-2. Assign priority (0.0-1.0) based on:
-   - Visual prominence (size, position)
-   - Semantic relevance to goal
-   - Interactivity (buttons > links > text)
-3. Observations should be factual, not interpretive
-4. next_action_hint is optional but helpful
-5. Only use element IDs from the provided list
+1. Identify 3-10 elements most relevant to the CURRENT SUBTASK
+2. Assign priority based on:
+   - Semantic relevance to CURRENT SUBTASK
+   - Element type appropriateness (input > button for typing tasks)
+   - Visual prominence
+   - Interactivity
+3. For search tasks: prioritize ACTUAL input fields (type="text" or "search"), NOT submit buttons!
+4. Observations should be factual about what's visible NOW
+5. Check if current subtask is already achieved on this page
 
 Return ONLY valid JSON, no markdown."""
 
@@ -127,7 +139,7 @@ Return ONLY valid JSON, no markdown."""
         return hashlib.md5(key_string.encode()).hexdigest()
 
     def _create_detail_key(self, structure_key: str, goal: str) -> str:
-        """Ключ для кэша детального анализа (зависит от цели)"""
+        """Ключ для кэша детального анализа"""
         key_string = f"{structure_key}|{goal}"
         return hashlib.md5(key_string.encode()).hexdigest()
 
@@ -137,17 +149,13 @@ Return ONLY valid JSON, no markdown."""
             return None
 
         text = text.strip()
-
-        # Удаляем markdown если есть
         text = text.replace('```json', '').replace('```', '').strip()
 
-        # Прямой парсинг
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Извлечение между { }
         try:
             start = text.find('{')
             end = text.rfind('}') + 1
@@ -156,7 +164,6 @@ Return ONLY valid JSON, no markdown."""
         except json.JSONDecodeError:
             pass
 
-        # Поиск первого валидного JSON
         depth = 0
         start_pos = -1
         for i, char in enumerate(text):
@@ -208,7 +215,6 @@ Return ONLY valid JSON, no markdown."""
         texts = []
         total_chars = 0
 
-        # Приоритет: заголовки, кнопки, видимые элементы
         priority_elements = sorted(
             elements,
             key=lambda e: (
@@ -229,19 +235,15 @@ Return ONLY valid JSON, no markdown."""
 
     def _heuristic_structure_analysis(self, stats: Dict) -> Dict:
         """Эвристическое определение типа страницы"""
-        # Поиск
         if 'search' in stats['input_types'] or (stats['inputs'] == 1 and stats['buttons'] >= 1):
             return {'page_type': 'search_page', 'confidence': 0.7}
 
-        # Результаты поиска
         if stats['links'] > 10 and stats['lists'] > 0:
             return {'page_type': 'search_results', 'confidence': 0.6}
 
-        # Форма
         if stats['inputs'] >= 3 and stats['forms'] >= 1:
             return {'page_type': 'form', 'confidence': 0.7}
 
-        # Статья (мало интерактивных элементов)
         if stats['links'] < 5 and stats['inputs'] == 0:
             return {'page_type': 'article', 'confidence': 0.5}
 
@@ -253,20 +255,13 @@ Return ONLY valid JSON, no markdown."""
         title: str,
         elements: List[Element]
     ) -> Dict:
-        """
-        Фаза 1: Быстрый структурный анализ страницы.
-
-        Определяет тип страницы без детального анализа элементов.
-        """
-        # Проверяем кэш
+        """Фаза 1: Быстрый структурный анализ страницы"""
         cache_key = self._create_structure_key(url, title, len(elements))
         if cache_key in self._structure_cache:
             return self._structure_cache[cache_key]
 
-        # Собираем статистику элементов
         stats = self._collect_element_stats(elements)
 
-        # Компактное описание для LLM
         summary = f"""URL: {url}
 Title: {title}
 
@@ -290,7 +285,6 @@ Key text snippets:
             data = self._parse_json_response(response.content)
 
             if data and 'page_type' in data:
-                # Кэшируем
                 self._structure_cache[cache_key] = data
                 self._limit_cache(self._structure_cache)
                 return data
@@ -298,7 +292,6 @@ Key text snippets:
         except Exception as e:
             print(f"⚠️  Structure analysis failed: {e}")
 
-        # Fallback: эвристический анализ
         return self._heuristic_structure_analysis(stats)
 
     def _format_elements_for_detail_analysis(
@@ -307,11 +300,10 @@ Key text snippets:
         page_type: str
     ) -> str:
         """
-        Форматирует элементы для детального анализа.
+        Форматирует элементы с ЯВНЫМ указанием типов.
 
-        Адаптивная детализация на основе типа страницы.
+        КРИТИЧНО: Показываем разницу между input и button!
         """
-        # Фильтруем по типу страницы
         if page_type == 'search_page':
             priority_tags = {'input', 'button', 'form'}
         elif page_type == 'search_results':
@@ -320,10 +312,13 @@ Key text snippets:
             priority_tags = {'h1', 'h2', 'h3', 'a', 'button'}
         elif page_type in ['email_inbox', 'email_list', 'vacancy_list']:
             priority_tags = {'a', 'button', 'input'}
+        elif page_type in ['cart', 'checkout']:
+            priority_tags = {'button', 'input', 'a'}
+        elif page_type == 'product':
+            priority_tags = {'button', 'input', 'select'}
         else:
             priority_tags = {'input', 'button', 'a'}
 
-        # Сортируем: приоритетные теги → видимые → позиция
         sorted_elements = sorted(
             elements,
             key=lambda e: (
@@ -335,7 +330,24 @@ Key text snippets:
 
         lines = []
         for elem in sorted_elements[:20]:
-            parts = [f"[{elem.id}]", elem.tag.upper()]
+            parts = [f"[{elem.id}]"]
+
+            # КРИТИЧНО: Явно показываем тип элемента
+            if elem.tag == 'input':
+                if elem.type in ['submit', 'button']:
+                    parts.append(f"BUTTON(submit)")  # ⚠️ Это кнопка, не input!
+                elif elem.type in ['text', 'search', 'email', 'tel']:
+                    parts.append(f"INPUT(text)")  # ✅ Это настоящий input
+                else:
+                    parts.append(f"INPUT({elem.type})")
+            elif elem.tag == 'button':
+                parts.append("BUTTON")
+            elif elem.tag == 'a':
+                parts.append("LINK")
+            elif elem.tag == 'select':
+                parts.append("SELECT")
+            else:
+                parts.append(elem.tag.upper())
 
             if elem.text:
                 text = elem.text[:40].replace('\n', ' ').strip()
@@ -344,9 +356,6 @@ Key text snippets:
 
             if elem.placeholder:
                 parts.append(f'placeholder="{elem.placeholder[:25]}"')
-
-            if elem.type:
-                parts.append(f'type={elem.type}')
 
             if elem.href:
                 href = elem.href.split('/')[-1][:30] if '/' in elem.href else elem.href[:30]
@@ -387,19 +396,31 @@ Key text snippets:
         page_type: str,
         confidence: float
     ) -> PageAnalysis:
-        """Создаёт fallback анализ на основе эвристик"""
-        # Берём видимые интерактивные элементы
-        interactive = [
-            e for e in elements
-            if e.is_in_viewport and e.tag in ['input', 'button', 'a']
-        ][:10]
+        """Создаёт fallback анализ с умной фильтрацией"""
+        # КРИТИЧНО: Приоритизируем НАСТОЯЩИЕ input поля
+        interactive = []
+
+        # Сначала ищем настоящие input поля
+        for e in elements:
+            if e.is_in_viewport and e.tag == 'input' and e.type in ['text', 'search', 'email', 'tel']:
+                interactive.append(e)
+
+        # Потом кнопки и ссылки
+        for e in elements:
+            if e.is_in_viewport and e.tag in ['button', 'a']:
+                if e not in interactive:
+                    interactive.append(e)
+
+        interactive = interactive[:10]
 
         priorities = {}
         for i, elem in enumerate(interactive):
             base_priority = 1.0 - (i * 0.1)
-            if elem.tag == 'button':
-                base_priority += 0.1
-            elif elem.tag == 'input':
+
+            # КРИТИЧНО: Настоящие input поля имеют ВЫСШИЙ приоритет
+            if elem.tag == 'input' and elem.type in ['text', 'search']:
+                base_priority += 0.2
+            elif elem.tag == 'button':
                 base_priority += 0.05
 
             priorities[elem.id] = min(base_priority, 1.0)
@@ -410,7 +431,8 @@ Key text snippets:
             observations=["Fallback analysis - using heuristics"],
             confidence=confidence * 0.5,
             context="Heuristic element selection",
-            element_priorities=priorities
+            element_priorities=priorities,
+            subtask_achieved=False
         )
 
     async def analyze_page(
@@ -419,38 +441,37 @@ Key text snippets:
         url: str,
         title: str,
         elements: List[Element],
-        use_cache: bool = True
+        use_cache: bool = True,
+        task_context: str = ""
     ) -> PageAnalysis:
-        """
-        Двухфазный анализ страницы.
-
-        Фаза 1: Определение структуры и типа
-        Фаза 2: Детальный анализ релевантных элементов
-        """
-        # Фаза 1: Структурный анализ (кэшируется по странице)
-        structure = await self._analyze_structure(url, title, elements)  # ИСПРАВЛЕНО: добавлен await
+        """Двухфазный анализ страницы"""
+        structure = await self._analyze_structure(url, title, elements)
         page_type = structure.get('page_type', 'other')
         structure_confidence = structure.get('confidence', 0.5)
 
-        # Проверяем кэш детального анализа
-        if use_cache:
+        if use_cache and not task_context:
             structure_key = self._create_structure_key(url, title, len(elements))
             detail_key = self._create_detail_key(structure_key, goal)
 
             if detail_key in self._detail_cache:
                 return self._detail_cache[detail_key]
 
-        # Фаза 2: Детальный анализ элементов
         elements_str = self._format_elements_for_detail_analysis(elements, page_type)
 
-        user_message = f"""GOAL: {goal}
+        context_section = f"\n{task_context}\n" if task_context else ""
 
-PAGE TYPE: {page_type} (confidence: {structure_confidence:.2f})
+        user_message = f"""{context_section}PAGE TYPE: {page_type} (confidence: {structure_confidence:.2f})
 
-ELEMENTS:
+CURRENT FOCUS: {goal}
+
+ELEMENTS (with explicit types):
 {elements_str}
 
-Identify elements relevant to achieving the goal."""
+IMPORTANT: Pay attention to element types!
+- INPUT(text) or INPUT(search) can be typed into
+- BUTTON(submit) or BUTTON cannot be typed into (only clicked)
+
+Identify elements relevant to achieving the current focus and determine if it's already achieved."""
 
         try:
             response = await self.llm.generate_simple(
@@ -464,12 +485,10 @@ Identify elements relevant to achieving the goal."""
                 print("⚠️  Vision Agent: JSON parse failed, using fallback")
                 return self._create_fallback_analysis(elements, page_type, structure_confidence)
 
-            # Валидация
             if not self._validate_detail_response(data):
                 print("⚠️  Vision Agent: Invalid response structure")
                 return self._create_fallback_analysis(elements, page_type, structure_confidence)
 
-            # Создаём анализ
             analysis = PageAnalysis(
                 page_type=page_type,
                 relevant_elements=data.get('relevant_elements', []),
@@ -478,11 +497,14 @@ Identify elements relevant to achieving the goal."""
                 context=data.get('context', ''),
                 next_action_hint=data.get('next_action_hint'),
                 element_priorities=data.get('element_priorities', {}),
+                subtask_achieved=data.get('subtask_achieved', False),
                 raw_response=response.content
             )
 
-            # Кэшируем
-            if use_cache:
+            if analysis.subtask_achieved:
+                print(f"✓ Vision Agent: subtask appears to be achieved")
+
+            if use_cache and not task_context:
                 structure_key = self._create_structure_key(url, title, len(elements))
                 detail_key = self._create_detail_key(structure_key, goal)
                 self._detail_cache[detail_key] = analysis
@@ -501,13 +523,7 @@ Identify elements relevant to achieving the goal."""
         max_elements: int = 20
     ) -> List[Element]:
         """
-        Умная фильтрация элементов.
-
-        Стратегия:
-        1. Берём элементы из relevant_ids
-        2. Если мало - добавляем видимые интерактивные
-        3. Если всё ещё мало - добавляем любые видимые
-        4. Ограничиваем max_elements
+        Умная фильтрация с приоритетом настоящим input полям
         """
         relevant = []
         relevant_id_set = set(relevant_ids)
@@ -517,9 +533,19 @@ Identify elements relevant to achieving the goal."""
             if elem.id in relevant_id_set:
                 relevant.append(elem)
 
-        # Шаг 2: Если мало релевантных, добавляем видимые интерактивные
+        # Шаг 2: Если мало релевантных, добавляем НАСТОЯЩИЕ input поля
         if len(relevant) < 5:
-            interactive_tags = {'input', 'button', 'a', 'select', 'textarea'}
+            for elem in all_elements:
+                if (elem.is_in_viewport and
+                        elem.tag == 'input' and
+                        elem.type in ['text', 'search', 'email', 'tel'] and
+                        elem not in relevant and
+                        len(relevant) < max_elements):
+                    relevant.append(elem)
+
+        # Шаг 3: Добавляем другие интерактивные элементы
+        if len(relevant) < 5:
+            interactive_tags = {'button', 'a', 'select'}
 
             for elem in all_elements:
                 if (elem.is_in_viewport and
@@ -528,7 +554,7 @@ Identify elements relevant to achieving the goal."""
                         len(relevant) < max_elements):
                     relevant.append(elem)
 
-        # Шаг 3: Если всё ещё мало, добавляем любые видимые
+        # Шаг 4: Любые видимые
         if len(relevant) < 3:
             for elem in all_elements:
                 if (elem.is_in_viewport and
@@ -536,8 +562,9 @@ Identify elements relevant to achieving the goal."""
                         len(relevant) < max_elements):
                     relevant.append(elem)
 
-        # Сортируем: видимые первыми, потом по позиции Y (сверху вниз)
+        # Сортируем: настоящие input первыми
         relevant.sort(key=lambda e: (
+            not (e.tag == 'input' and e.type in ['text', 'search']),
             not e.is_in_viewport,
             e.position.get('y', 0)
         ))
@@ -545,7 +572,7 @@ Identify elements relevant to achieving the goal."""
         return relevant[:max_elements]
 
     def _limit_cache(self, cache: Dict):
-        """Ограничивает размер кэша (FIFO)"""
+        """Ограничивает размер кэша"""
         if len(cache) > self._cache_size:
             to_remove = len(cache) - int(self._cache_size * 0.8)
             for _ in range(to_remove):
